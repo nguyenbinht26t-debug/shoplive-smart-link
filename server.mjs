@@ -347,7 +347,8 @@ function keyOk(req, requestUrl) {
 
 function commandExists(command) {
   return new Promise(resolve => {
-    execFile(command, ['--version'], { timeout: 4000 }, error => resolve(!error));
+    const args = command === 'ffmpeg' ? ['-version'] : ['--version'];
+    execFile(command, args, { timeout: 4000 }, error => resolve(!error));
   });
 }
 
