@@ -1,29 +1,44 @@
-# ShopLive AI Smart Link Server
+# ShopLive AI Smart Link Gateway 2.6.9
 
-Máy chủ này nhận link chia sẻ **công khai, không DRM** từ YouTube/Facebook/TikTok/Vimeo/Instagram (hoặc link media trực tiếp), sau đó chuẩn hóa thành MPEG-TS H.264/AAC để app Android đưa vào encoder livestream. Chỉ sử dụng video bạn sở hữu hoặc có quyền phát lại.
+Gateway nhận URL công khai/không DRM, dùng yt-dlp khi cần, sau đó FFmpeg chuẩn hóa thành H.264/AAC để Android phát và encode lại lên nền tảng Live.
 
-## Cách chạy bằng Docker
+## Endpoint
+
+Health:
+
+`GET /health`
+
+Smart Link 2.6.9:
+
+`GET /api/source-v2?key=<KEY>&container=fmp4&url=<URL_ENCODED>`
+
+Endpoint `/api/source` vẫn giữ cho client cũ. App 2.6.9 chủ động dùng `/api/source-v2` để phát hiện ngay trường hợp Render chưa được cập nhật.
+
+## Điểm mới 2.6.9
+
+- fMP4 (`video/mp4`) là container mặc định được app 2.6.9 yêu cầu.
+- HTTP 200 chỉ được gửi sau khi FFmpeg thực sự tạo media init hợp lệ.
+- Lỗi yt-dlp/FFmpeg trả HTTP 502 JSON để Android hiển thị nguyên nhân thật.
+- Response có `x-shoplive-gateway-version` và `x-shoplive-container`.
+
+## Docker
+
 ```bash
 docker build -t shoplive-smart-link .
-docker run --rm -p 8787:8787 -e GATEWAY_API_KEY=KHOA_CUA_BAN shoplive-smart-link
+docker run --rm -p 8787:8787 \
+  -e GATEWAY_API_KEY=KHOA_CUA_BAN \
+  shoplive-smart-link
 ```
 
-Kiểm tra:
-`GET /health?key=KHOA_CUA_BAN`
+Dockerfile cài FFmpeg và cập nhật yt-dlp khi build image.
 
-Nguồn video:
-`GET /api/source?key=KHOA_CUA_BAN&url=<LINK_DA_MA_HOA_URL>`
+## Cookies tùy chọn
 
-## Dùng trong APK
-Không cần hiện Gateway trong giao diện. Trước khi build, thêm vào `local.properties`:
-```properties
-SHOPLIVE_SMART_LINK_URL=https://link-api.tenmiencuaban.vn
-SHOPLIVE_SMART_LINK_KEY=KHOA_CUA_BAN
-```
+Một số link YouTube/Facebook có thể yêu cầu đăng nhập/chống bot. Gateway hỗ trợ `YTDLP_COOKIES_B64`; không đặt cookie trong APK.
 
-Server production nên chạy HTTPS. Không mở server public nếu chưa đặt API key mạnh, rate limit/firewall ở reverse proxy.
+## An toàn
 
-## Giới hạn
-- Không hỗ trợ DRM, paywall, nội dung riêng tư mà server không được phép truy cập.
-- Nền tảng có thể thay đổi cơ chế phát video; hãy cập nhật `yt-dlp` định kỳ.
-- Một số nội dung thuộc tài khoản của chính bạn có thể cần cookies do bạn tự cung cấp qua `YTDLP_COOKIES_FILE`.
+- Dùng HTTPS ở production.
+- Đặt API key mạnh và giữ biến môi trường ở server.
+- Chỉ phát nội dung bạn sở hữu hoặc có quyền sử dụng.
+- Không hỗ trợ DRM/paywall/private content khi Gateway không có quyền truy cập.

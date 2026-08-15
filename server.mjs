@@ -22,6 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
+const GATEWAY_VERSION = '2.7.0';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -29,7 +30,17 @@ const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const YTDLP = process.env.YTDLP || 'yt-dlp';
 const RESOLUTION = process.env.RESOLUTION || '720:1280';
 const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '2500k';
-const YTDLP_COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || '').trim();
+let YTDLP_COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || '').trim();
+const YTDLP_COOKIES_B64 = (process.env.YTDLP_COOKIES_B64 || '').trim();
+if (!YTDLP_COOKIES_FILE && YTDLP_COOKIES_B64) {
+  try {
+    YTDLP_COOKIES_FILE = '/tmp/shoplive-ytdlp-cookies.txt';
+    fs.writeFileSync(YTDLP_COOKIES_FILE, Buffer.from(YTDLP_COOKIES_B64, 'base64'), { mode: 0o600 });
+  } catch (e) {
+    console.error('[yt-dlp cookies] cannot decode YTDLP_COOKIES_B64:', e.message);
+    YTDLP_COOKIES_FILE = '';
+  }
+}
 
 // OAuth account connection broker. Provider app secrets stay on the Gateway, never in the APK.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
@@ -347,8 +358,7 @@ function keyOk(req, requestUrl) {
 
 function commandExists(command) {
   return new Promise(resolve => {
-    const args = command === 'ffmpeg' ? ['-version'] : ['--version'];
-    execFile(command, args, { timeout: 4000 }, error => resolve(!error));
+    execFile(command, ['--version'], { timeout: 4000 }, error => resolve(!error));
   });
 }
 
@@ -563,39 +573,275 @@ async function safePublicUrl(raw) {
   return parsed.toString();
 }
 
-function ytdlpPipeArgs(sourceUrl) {
+const sourceResolveCache = new Map();
+
+function ytdlpJsonArgs(sourceUrl) {
+  // Resolve the webpage first instead of piping yt-dlp's downloaded file to ffmpeg. This lets
+  // yt-dlp select separate best video + best audio streams (common on YouTube) while ffmpeg reads
+  // both CDN URLs directly and transcodes them in real time.
   const args = [
     '--no-playlist', '--no-progress', '--no-warnings',
-    '-f', 'best[height<=1080]/best',
-    '-o', '-', sourceUrl
+    '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2',
+    '--skip-download', '--dump-single-json',
+    '-f', 'bv*[height<=1080]+ba/b[height<=1080]/best',
+    sourceUrl
   ];
   if (YTDLP_COOKIES_FILE) args.unshift('--cookies', YTDLP_COOKIES_FILE);
   return args;
 }
 
-function ffmpegTranscodeTail() {
-  return [
-    '-map', '0:v:0', '-map', '0:a:0?',
+function runYtDlpJson(sourceUrl) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      YTDLP,
+      ytdlpJsonArgs(sourceUrl),
+      { timeout: 35_000, maxBuffer: 12 * 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = String(stderr || error.message || 'yt-dlp failed').trim().slice(-1400);
+          return reject(new Error(detail || 'yt-dlp failed'));
+        }
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (e) {
+          reject(new Error(`yt-dlp trả dữ liệu không hợp lệ: ${e.message}`));
+        }
+      }
+    );
+  });
+}
+
+function safeHttpHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return {};
+  const blocked = new Set(['host', 'content-length', 'connection', 'accept-encoding']);
+  const clean = {};
+  for (const [rawKey, rawValue] of Object.entries(headers)) {
+    const key = String(rawKey || '').trim();
+    const value = String(rawValue ?? '').replace(/[\r\n]+/g, ' ').trim();
+    if (!key || !value || blocked.has(key.toLowerCase())) continue;
+    if (!/^[A-Za-z0-9-]+$/.test(key)) continue;
+    clean[key] = value.slice(0, 2000);
+  }
+  return clean;
+}
+
+function formatToInput(format, fallbackHeaders = {}) {
+  const url = String(format?.url || '').trim();
+  if (!/^https?:\/\//i.test(url)) return null;
+  return {
+    url,
+    headers: safeHttpHeaders({ ...fallbackHeaders, ...(format?.http_headers || {}) })
+  };
+}
+
+function pickResolvedInputs(info) {
+  const baseHeaders = safeHttpHeaders(info?.http_headers || {});
+  const requested = Array.isArray(info?.requested_formats) ? info.requested_formats : [];
+
+  if (requested.length) {
+    const videoFmt = requested.find(f => f && f.vcodec && f.vcodec !== 'none') || null;
+    const audioFmt = requested.find(f => f && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+      || requested.find(f => f && f.acodec && f.acodec !== 'none') || null;
+    const video = formatToInput(videoFmt, baseHeaders);
+    const audio = formatToInput(audioFmt, baseHeaders);
+    if (!video) throw new Error('yt-dlp không trả URL video có thể phát');
+    if (audio && audio.url !== video.url) return { inputs: [video, audio], videoIndex: 0, audioIndex: 1 };
+    return { inputs: [video], videoIndex: 0, audioIndex: audio ? 0 : null };
+  }
+
+  const combined = formatToInput(info, baseHeaders);
+  if (!combined) throw new Error('yt-dlp không trả URL media có thể phát');
+  const hasAudio = info?.acodec && info.acodec !== 'none';
+  return { inputs: [combined], videoIndex: 0, audioIndex: hasAudio ? 0 : null };
+}
+
+async function resolvePageMedia(sourceUrl) {
+  const now = Date.now();
+  const cached = sourceResolveCache.get(sourceUrl);
+  if (cached && cached.expiresAt > now) return cached.promise;
+
+  const promise = runYtDlpJson(sourceUrl)
+    .then(info => pickResolvedInputs(info))
+    .catch(error => {
+      sourceResolveCache.delete(sourceUrl);
+      throw error;
+    });
+  // Short cache is enough to deduplicate the video/audio ExoPlayer requests without holding
+  // signed CDN URLs for too long.
+  sourceResolveCache.set(sourceUrl, { expiresAt: now + 90_000, promise });
+  return promise;
+}
+
+function ffmpegHeaderValue(headers) {
+  const entries = Object.entries(headers || {});
+  if (!entries.length) return '';
+  return entries.map(([key, value]) => `${key}: ${value}\r\n`).join('');
+}
+
+function ffmpegInputArgs(input) {
+  const args = [
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-rw_timeout', '15000000'
+  ];
+  const headerValue = ffmpegHeaderValue(input.headers);
+  if (headerValue) args.push('-headers', headerValue);
+  args.push('-i', input.url);
+  return args;
+}
+
+function ffmpegTranscodeTail(videoIndex = 0, audioIndex = 0, container = 'ts') {
+  const args = [
+    '-map', `${videoIndex}:v:0`,
+  ];
+  if (audioIndex === null || audioIndex === undefined) args.push('-map', `${videoIndex}:a:0?`);
+  else args.push('-map', `${audioIndex}:a:0?`);
+  args.push(
+    '-fflags', '+genpts',
     '-vf', `scale=${RESOLUTION}:force_original_aspect_ratio=decrease,pad=${RESOLUTION}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
     '-r', '30',
     '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
     '-pix_fmt', 'yuv420p', '-b:v', VIDEO_BITRATE, '-maxrate', VIDEO_BITRATE, '-bufsize', '5000k', '-g', '60',
-    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-    '-f', 'mpegts', 'pipe:1'
-  ];
+    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2'
+  );
+
+  // 2.7.0: prefer HTTP-FLV for Android Smart Link. FLV has a tiny fixed magic header,
+  // is naturally streamable over chunked HTTP, and carries H.264/AAC without the MP4 brand/init
+  // ambiguity seen on some proxies/devices. fMP4/TS stay available for older builds/debugging.
+  if (container === 'flv') {
+    args.push('-flvflags', 'no_duration_filesize', '-f', 'flv', 'pipe:1');
+  } else if (container === 'fmp4') {
+    args.push(
+      '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+      '-frag_duration', '1000000',
+      '-f', 'mp4', 'pipe:1'
+    );
+  } else {
+    args.push('-f', 'mpegts', 'pipe:1');
+  }
+  return args;
 }
 
-function ffmpegForDirect(sourceUrl) {
+function ffmpegForDirect(sourceUrl, container = 'ts') {
   return [
-    '-hide_banner', '-loglevel', 'warning',
-    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-i', sourceUrl,
-    ...ffmpegTranscodeTail()
+    '-hide_banner', '-loglevel', 'warning', '-nostdin',
+    ...ffmpegInputArgs({ url: sourceUrl, headers: {} }),
+    ...ffmpegTranscodeTail(0, 0, container)
   ];
 }
 
-function ffmpegForPipe() {
-  return ['-hide_banner', '-loglevel', 'warning', '-i', 'pipe:0', ...ffmpegTranscodeTail()];
+function ffmpegForResolved(resolved, container = 'ts') {
+  const args = ['-hide_banner', '-loglevel', 'warning', '-nostdin'];
+  for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input));
+  args.push(...ffmpegTranscodeTail(resolved.videoIndex, resolved.audioIndex, container));
+  return args;
+}
+
+function looksLikeTs(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 188 * 3) return false;
+  // Allow a small prefix, but require three consecutive MPEG-TS sync bytes 188 bytes apart.
+  const maxOffset = Math.min(187, buffer.length - 188 * 3);
+  for (let offset = 0; offset <= maxOffset; offset++) {
+    if (buffer[offset] === 0x47 && buffer[offset + 188] === 0x47 && buffer[offset + 376] === 0x47) return true;
+  }
+  return false;
+}
+
+function looksLikeFlv(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 13) return false;
+  // Signature 'FLV', version 1, flags include audio/video, DataOffset >= 9.
+  if (buffer[0] !== 0x46 || buffer[1] !== 0x4c || buffer[2] !== 0x56) return false;
+  if (buffer[3] !== 0x01) return false;
+  const flags = buffer[4];
+  if ((flags & 0x05) === 0) return false;
+  const dataOffset = buffer.readUInt32BE(5);
+  return dataOffset >= 9 && dataOffset <= buffer.length;
+}
+
+function looksLikeFmp4(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  // A valid FFmpeg fragmented MP4 starts with an ISO-BMFF box such as ftyp, followed by moov.
+  // Search only the initialization prefix so random payload bytes cannot satisfy this check.
+  const head = buffer.subarray(0, Math.min(buffer.length, 64 * 1024));
+  let offset = 0;
+  let sawFtyp = false;
+  let sawMoov = false;
+  while (offset + 8 <= head.length) {
+    let size = head.readUInt32BE(offset);
+    const type = head.toString('ascii', offset + 4, offset + 8);
+    if (size === 1) {
+      if (offset + 16 > head.length) break;
+      const big = head.readBigUInt64BE(offset + 8);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) break;
+      size = Number(big);
+    } else if (size === 0) {
+      size = head.length - offset;
+    }
+    if (size < 8) break;
+    if (type === 'ftyp') sawFtyp = true;
+    if (type === 'moov') sawMoov = true;
+    if (sawFtyp && sawMoov) return true;
+    if (offset + size > head.length) break;
+    offset += size;
+  }
+  return sawFtyp && buffer.length >= 1024;
+}
+
+function probeFfmpegOutput(ff, container, timeoutMs = 25000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let stderrTail = '';
+    let settled = false;
+
+    const timer = setTimeout(() => fail(new Error(`FFmpeg không tạo dữ liệu ${container} sau ${Math.round(timeoutMs / 1000)} giây`)), timeoutMs);
+    const onStderr = chunk => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-5000);
+    };
+    const onError = err => fail(err);
+    const onClose = code => {
+      if (!settled) fail(new Error((stderrTail.trim() || `FFmpeg kết thúc sớm (code ${code})`).slice(-1800)));
+    };
+    const onData = chunk => {
+      if (settled) return;
+      chunks.push(chunk);
+      total += chunk.length;
+      if (total > 512 * 1024) {
+        const prefix = Buffer.concat(chunks, total);
+        return fail(new Error(`FFmpeg có dữ liệu nhưng không phải ${container}; prefix=${prefix.subarray(0, 24).toString('hex')}`));
+      }
+      if (total < 1024) return;
+      const prefix = Buffer.concat(chunks, total);
+      const valid = container === 'flv' ? looksLikeFlv(prefix) : (container === 'fmp4' ? looksLikeFmp4(prefix) : looksLikeTs(prefix));
+      if (!valid) return;
+
+      settled = true;
+      clearTimeout(timer);
+      ff.stdout.pause();
+      ff.stdout.off('data', onData);
+      ff.stderr.off('data', onStderr);
+      ff.off('error', onError);
+      ff.off('close', onClose);
+      resolve({ prefix, stderrTail });
+    };
+
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ff.stdout.off('data', onData);
+      ff.stderr.off('data', onStderr);
+      ff.off('error', onError);
+      ff.off('close', onClose);
+      if (!ff.killed) ff.kill('SIGKILL');
+      const detail = stderrTail.trim();
+      reject(new Error(detail ? `${error.message} • ${detail.slice(-1600)}` : error.message));
+    }
+
+    ff.stderr.on('data', onStderr);
+    ff.on('error', onError);
+    ff.on('close', onClose);
+    ff.stdout.on('data', onData);
+  });
 }
 
 async function handleSource(req, res, requestUrl) {
@@ -603,61 +849,93 @@ async function handleSource(req, res, requestUrl) {
   const raw = requestUrl.searchParams.get('url');
   if (!raw) return json(res, 400, { ok: false, error: 'missing url' });
 
+  const requestedContainer = requestUrl.searchParams.get('container');
+  const container = requestedContainer === 'flv' ? 'flv' : (requestedContainer === 'fmp4' ? 'fmp4' : 'ts');
+
   let sourceUrl;
   try { sourceUrl = await safePublicUrl(raw); }
   catch (e) { return json(res, 400, { ok: false, error: e.message }); }
 
   const parsed = new URL(sourceUrl);
   const pageSource = supportedShareHost(parsed.hostname);
-
-  res.writeHead(200, {
-    'content-type': 'video/mp2t',
-    'cache-control': 'no-store, no-cache, must-revalidate',
-    'connection': 'keep-alive',
-    'x-shoplive-source': pageSource ? 'smart-link' : 'direct'
-  });
-
-  let extractor = null;
-  const ff = spawn(FFMPEG, pageSource ? ffmpegForPipe() : ffmpegForDirect(sourceUrl), {
-    stdio: [pageSource ? 'pipe' : 'ignore', 'pipe', 'pipe'], windowsHide: true
-  });
-
+  let ffArgs;
   if (pageSource) {
-    extractor = spawn(YTDLP, ytdlpPipeArgs(sourceUrl), { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    extractor.stdout.pipe(ff.stdin);
-    extractor.stderr.on('data', chunk => console.error('[yt-dlp]', chunk.toString().trim()));
-    extractor.on('error', err => {
-      console.error('[yt-dlp error]', err.message);
-      if (!ff.stdin.destroyed) ff.stdin.destroy(err);
-    });
-    extractor.on('close', code => {
-      if (code !== 0) console.error(`yt-dlp exited ${code}`);
-      if (!ff.stdin.destroyed) ff.stdin.end();
-    });
+    try {
+      const resolved = await resolvePageMedia(sourceUrl);
+      ffArgs = ffmpegForResolved(resolved, container);
+    } catch (e) {
+      const message = String(e?.message || 'Không tách được link').slice(-1600);
+      console.error('[smart-link resolve]', message);
+      return json(res, 502, {
+        ok: false,
+        error: message,
+        gatewayVersion: GATEWAY_VERSION,
+        hint: /cookie|sign in|bot|login/i.test(message)
+          ? 'Nguồn yêu cầu đăng nhập/chống bot. Cấu hình YTDLP_COOKIES_B64 trên Gateway rồi deploy lại.'
+          : 'Không tách được link công khai. Kiểm tra link còn xem được và không DRM.'
+      });
+    }
+  } else {
+    ffArgs = ffmpegForDirect(sourceUrl, container);
   }
+
+  const ff = spawn(FFMPEG, ffArgs, {
+    stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true
+  });
 
   let closed = false;
   const stop = () => {
     if (closed) return;
     closed = true;
-    if (extractor && !extractor.killed) extractor.kill('SIGKILL');
     if (!ff.killed) ff.kill('SIGKILL');
   };
-  req.on('close', stop);
   res.on('close', stop);
+  req.on('error', stop);
+
+  // 2.7.0: never return HTTP 200 until FFmpeg has emitted a valid container signature.
+  // Previously a failed FFmpeg process produced an empty HTTP 200 body, so Media3 reported
+  // ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED instead of the real yt-dlp/FFmpeg error.
+  let probe;
+  try {
+    probe = await probeFfmpegOutput(ff, container);
+  } catch (e) {
+    const message = String(e?.message || 'FFmpeg không tạo được media').slice(-2200);
+    console.error('[smart-link ffmpeg probe]', message);
+    if (!res.destroyed && !res.headersSent) {
+      return json(res, 502, {
+        ok: false,
+        error: message,
+        gatewayVersion: GATEWAY_VERSION,
+        hint: 'Gateway không tạo được luồng H.264/AAC. Xem Render logs; nếu là YouTube/Facebook chống bot, cập nhật yt-dlp/cookies.'
+      });
+    }
+    return;
+  }
+
+  if (closed || res.destroyed) return stop();
+
+  res.writeHead(200, {
+    'content-type': container === 'flv' ? 'video/x-flv' : (container === 'fmp4' ? 'video/mp4' : 'video/mp2t'),
+    'cache-control': 'no-store, no-cache, must-revalidate',
+    'connection': 'keep-alive',
+    'x-shoplive-source': pageSource ? 'smart-link-resolved' : 'direct',
+    'x-shoplive-container': container,
+    'x-shoplive-gateway-version': GATEWAY_VERSION
+  });
+  res.write(probe.prefix);
 
   ff.stdout.pipe(res);
+  ff.stdout.resume();
   ff.stderr.on('data', chunk => console.error('[ffmpeg]', chunk.toString().trim()));
   ff.on('error', err => {
     console.error('[ffmpeg error]', err.message);
-    if (!res.headersSent) json(res, 500, { ok: false, error: 'ffmpeg unavailable' });
+    if (!res.headersSent) json(res, 500, { ok: false, error: 'ffmpeg unavailable', gatewayVersion: GATEWAY_VERSION });
     else res.destroy(err);
   });
   ff.on('close', code => {
     if (!closed && code !== 0) console.error(`ffmpeg exited ${code}`);
     if (!res.writableEnded) res.end();
     closed = true;
-    if (extractor && !extractor.killed) extractor.kill('SIGKILL');
   });
 }
 
@@ -676,7 +954,7 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/healthz') {
       const [ffmpeg, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ytdlp ? 200 : 503, { ok: ffmpeg && ytdlp });
+      return json(res, ffmpeg && ytdlp ? 200 : 503, { ok: ffmpeg && ytdlp, version: GATEWAY_VERSION });
     }
     if (requestUrl.pathname === '/health') {
       if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
@@ -685,10 +963,12 @@ const server = http.createServer(async (req, res) => {
         ok: ffmpeg && ytdlp,
         ffmpeg,
         ytdlp,
+        version: GATEWAY_VERSION,
+        cookiesConfigured: Boolean(YTDLP_COOKIES_FILE),
         resolution: RESOLUTION.replace(':', 'x')
       });
     }
-    if (requestUrl.pathname === '/api/source' && req.method === 'GET') return await handleSource(req, res, requestUrl);
+    if ((requestUrl.pathname === '/api/source' || requestUrl.pathname === '/api/source-v2' || requestUrl.pathname === '/api/source-v3') && req.method === 'GET') return await handleSource(req, res, requestUrl);
     return json(res, 404, { ok: false, error: 'not found' });
   } catch (e) {
     console.error(e);
@@ -698,7 +978,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`ShopLive Gateway listening on http://${HOST}:${PORT}`);
+  console.log(`ShopLive Gateway ${GATEWAY_VERSION} listening on http://${HOST}:${PORT}`);
   if (!API_KEY) console.warn('WARNING: GATEWAY_API_KEY is empty. Set a key before exposing this service outside your LAN.');
   if (!OAUTH_STORE_KEY) console.warn('WARNING: OAUTH_STORE_KEY is empty. OAuth tokens will only live in memory and are lost when Gateway restarts.');
   if (PUBLIC_BASE_URL && !PUBLIC_BASE_URL.startsWith('https://')) console.warn('WARNING: PUBLIC_BASE_URL must be HTTPS for provider OAuth callbacks.');
