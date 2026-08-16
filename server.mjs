@@ -22,11 +22,12 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.7.7';
+const GATEWAY_VERSION = '2.8.0';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
+const FFPROBE = process.env.FFPROBE || 'ffprobe';
 const YTDLP = process.env.YTDLP || 'yt-dlp';
 const RESOLUTION = process.env.RESOLUTION || '720:1280';
 const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '2500k';
@@ -617,7 +618,7 @@ function ytdlpJsonArgs(sourceUrl) {
     '--js-runtimes', 'node',
     '--socket-timeout', '20', '--retries', '3', '--fragment-retries', '3', '--extractor-retries', '3',
     '--skip-download', '--dump-single-json',
-    '-f', 'bv*[height<=1080]+ba/b[height<=1080]/best'
+    '-f', 'bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc1]+ba/best[vcodec^=avc1]/bv*+ba/best'
   ];
 
   const cookieFile = cookieFileForPlatform(platform);
@@ -678,13 +679,144 @@ function formatToInput(format, fallbackHeaders = {}) {
   if (!/^https?:\/\//i.test(url)) return null;
   return {
     url,
-    headers: safeHttpHeaders({ ...fallbackHeaders, ...(format?.http_headers || {}) })
+    headers: safeHttpHeaders({ ...fallbackHeaders, ...(format?.http_headers || {}) }),
+    vcodec: String(format?.vcodec || ''),
+    acodec: String(format?.acodec || '')
   };
 }
 
 function positiveInt(value) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function ratioNumber(value) {
+  const text = String(value || '').trim();
+  if (!text || text === 'N/A' || text === '0:1') return 0;
+  const parts = text.split(/[:/]/).map(Number);
+  if (parts.length === 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1]) && parts[1] !== 0) {
+    return parts[0] / parts[1];
+  }
+  const n = Number(text);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function normalizeRotation(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return ((Math.round(n) % 360) + 360) % 360;
+}
+
+function evenNative(value) {
+  const n = Math.max(2, Math.round(Number(value) || 0));
+  return n % 2 === 0 ? n : n + 1;
+}
+
+function ffmpegHttpProxyArgs(url, proxyUrl = YTDLP_PROXY) {
+  const normalizedProxy = String(proxyUrl || '').trim();
+  const normalizedUrl = String(url || '').trim();
+  if (!normalizedProxy || !/^https?:\/\//i.test(normalizedUrl)) return [];
+  return ['-http_proxy', normalizedProxy];
+}
+
+function runFfprobeGeometry(input) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height,sample_aspect_ratio,display_aspect_ratio:stream_tags=rotate:stream_side_data=rotation',
+      '-of', 'json'
+    ];
+    // yt-dlp may return a CDN URL bound to the proxy exit IP. FFprobe must use
+    // the same proxy or geometry probing can intermittently fall back after 403.
+    args.push(...ffmpegHttpProxyArgs(input?.url));
+    const headerValue = ffmpegHeaderValue(input?.headers || {});
+    if (headerValue) args.push('-headers', headerValue);
+    args.push(input.url);
+    execFile(
+      FFPROBE,
+      args,
+      { timeout: 25_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) return reject(new Error(String(stderr || error.message || 'ffprobe failed').trim().slice(-1600)));
+        try {
+          const json = JSON.parse(stdout || '{}');
+          const stream = Array.isArray(json.streams) ? json.streams[0] : null;
+          if (!stream) throw new Error('ffprobe không tìm thấy video stream');
+          const rawWidth = positiveInt(stream.width);
+          const rawHeight = positiveInt(stream.height);
+          if (!rawWidth || !rawHeight) throw new Error('ffprobe không đọc được width/height');
+          const sarText = String(stream.sample_aspect_ratio || '1:1');
+          const darText = String(stream.display_aspect_ratio || '');
+          const sar = ratioNumber(sarText) || 1;
+          const dar = ratioNumber(darText) || ((rawWidth * sar) / rawHeight);
+          let rotation = normalizeRotation(stream?.tags?.rotate);
+          if (Array.isArray(stream.side_data_list)) {
+            const side = stream.side_data_list.find(item => Number.isFinite(Number(item?.rotation)));
+            if (side) rotation = normalizeRotation(side.rotation);
+          }
+
+          // Convert non-square pixels to a square-pixel display frame without cropping.
+          // For the normal Facebook case SAR=1:1 this is exactly rawWidth x rawHeight.
+          let displayWidth = rawWidth;
+          let displayHeight = rawHeight;
+          if (Math.abs(sar - 1) > 0.0001) displayWidth = Math.max(2, Math.round(rawHeight * dar));
+          if (rotation === 90 || rotation === 270) [displayWidth, displayHeight] = [displayHeight, displayWidth];
+
+          resolve({
+            rawWidth,
+            rawHeight,
+            displayWidth: evenNative(displayWidth),
+            displayHeight: evenNative(displayHeight),
+            sar: sarText || '1:1',
+            dar: darText || `${displayWidth}:${displayHeight}`,
+            rotation
+          });
+        } catch (e) {
+          reject(new Error(`ffprobe JSON không hợp lệ: ${e.message}`));
+        }
+      }
+    );
+  });
+}
+
+async function enrichResolvedGeometry(resolved) {
+  const videoInput = resolved.inputs?.[resolved.videoIndex ?? 0];
+  if (!videoInput) return {
+    ...resolved,
+    rawWidth: resolved.sourceWidth,
+    rawHeight: resolved.sourceHeight,
+    displayWidth: evenNative(resolved.sourceWidth),
+    displayHeight: evenNative(resolved.sourceHeight),
+    sar: '1:1',
+    dar: resolved.sourceWidth && resolved.sourceHeight ? `${resolved.sourceWidth}:${resolved.sourceHeight}` : 'unknown',
+    geometrySource: 'yt-dlp-fallback'
+  };
+  try {
+    const geometry = await runFfprobeGeometry(videoInput);
+    return { ...resolved, ...geometry, sourceWidth: geometry.displayWidth, sourceHeight: geometry.displayHeight, geometrySource: 'ffprobe' };
+  } catch (e) {
+    console.warn('[smart-link ffprobe fallback]', e.message);
+    const fallbackW = evenNative(resolved.sourceWidth || 720);
+    const fallbackH = evenNative(resolved.sourceHeight || 1280);
+    return {
+      ...resolved,
+      rawWidth: resolved.sourceWidth || fallbackW,
+      rawHeight: resolved.sourceHeight || fallbackH,
+      displayWidth: fallbackW,
+      displayHeight: fallbackH,
+      sar: '1:1',
+      dar: `${fallbackW}:${fallbackH}`,
+      geometrySource: 'yt-dlp-fallback'
+    };
+  }
+}
+
+function nativeOutputSize(resolved) {
+  return {
+    width: evenNative(resolved.displayWidth || resolved.sourceWidth),
+    height: evenNative(resolved.displayHeight || resolved.sourceHeight)
+  };
 }
 
 function resolvedGeometry(info, videoFmt = null) {
@@ -702,18 +834,6 @@ function resolvedGeometry(info, videoFmt = null) {
   }
   if (rotation === 90 || rotation === 270) [width, height] = [height, width];
   return { sourceWidth: width, sourceHeight: height, rotation };
-}
-
-function fitSourceSize(width, height, longLimit = 1280, shortLimit = 720) {
-  const w = positiveInt(width);
-  const h = positiveInt(height);
-  if (!w || !h) return { width: 720, height: 1280 };
-  const landscape = w >= h;
-  const maxW = landscape ? longLimit : shortLimit;
-  const maxH = landscape ? shortLimit : longLimit;
-  const scale = Math.min(maxW / w, maxH / h, 1);
-  const even = value => Math.max(2, Math.round(value / 2) * 2);
-  return { width: even(w * scale), height: even(h * scale) };
 }
 
 function pickResolvedInputs(info) {
@@ -745,6 +865,7 @@ async function resolvePageMedia(sourceUrl) {
 
   const promise = runYtDlpJson(sourceUrl)
     .then(info => pickResolvedInputs(info))
+    .then(resolved => enrichResolvedGeometry(resolved))
     .catch(error => {
       sourceResolveCache.delete(sourceUrl);
       throw error;
@@ -763,20 +884,47 @@ function ffmpegHeaderValue(headers) {
 
 function ffmpegInputArgs(input, proxyUrl = '') {
   const args = [
+    '-re',
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-reconnect_on_network_error', '1', '-reconnect_on_http_error', '408,429,5xx',
     '-rw_timeout', '15000000'
   ];
-  // yt-dlp signs Googlevideo/Meta CDN URLs for the IP that extracted them. When
-  // extraction uses YTDLP_PROXY, FFmpeg must fetch every resolved input through
-  // the same proxy as well; otherwise the CDN sees Render's IP and returns 403.
-  // This is an FFmpeg input option, so it must appear before each corresponding -i.
-  const normalizedProxy = String(proxyUrl || '').trim();
-  if (normalizedProxy && /^https?:\/\//i.test(input.url)) {
-    args.push('-http_proxy', normalizedProxy);
-  }
+  // Keep the media download on the same exit IP used by yt-dlp. Without this,
+  // signed Googlevideo URLs may send a short FLV header and then fail with 403.
+  args.push(...ffmpegHttpProxyArgs(input?.url, proxyUrl));
   const headerValue = ffmpegHeaderValue(input.headers);
   if (headerValue) args.push('-headers', headerValue);
-  args.push('-i', input.url);
+  args.push('-thread_queue_size', '1024', '-i', input.url);
+  return args;
+}
+
+function codecIsH264(value) {
+  return /^(avc1|h264|avc)/i.test(String(value || ''));
+}
+
+function codecIsAac(value) {
+  return /^(mp4a|aac)/i.test(String(value || ''));
+}
+
+function canNativeCopy(resolved, container, targetSize) {
+  if (container !== 'flv') return false;
+  const native = nativeOutputSize(resolved);
+  if (!targetSize || targetSize.width !== native.width || targetSize.height !== native.height) return false;
+  if ((resolved.rotation || 0) !== 0 || Math.abs((ratioNumber(resolved.sar) || 1) - 1) > 0.0001) return false;
+  const video = resolved.inputs?.[resolved.videoIndex ?? 0];
+  const audio = resolved.audioIndex == null ? null : resolved.inputs?.[resolved.audioIndex];
+  return codecIsH264(video?.vcodec) && (!audio || codecIsAac(audio?.acodec));
+}
+
+function ffmpegCopyTail(videoIndex = 0, audioIndex = 0) {
+  const args = ['-map', `${videoIndex}:v:0`];
+  if (audioIndex === null || audioIndex === undefined) args.push('-map', `${videoIndex}:a:0?`);
+  else args.push('-map', `${audioIndex}:a:0?`);
+  args.push(
+    '-fflags', '+genpts', '-avoid_negative_ts', 'make_zero',
+    '-c:v', 'copy', '-c:a', 'copy',
+    '-flvflags', 'no_duration_filesize', '-f', 'flv', 'pipe:1'
+  );
   return args;
 }
 
@@ -786,17 +934,17 @@ function ffmpegTranscodeTail(videoIndex = 0, audioIndex = 0, container = 'ts', t
   ];
   if (audioIndex === null || audioIndex === undefined) args.push('-map', `${videoIndex}:a:0?`);
   else args.push('-map', `${audioIndex}:a:0?`);
-  // Preserve the complete source frame. Exact scale=w:h stretches odd Facebook
-  // sources when yt-dlp metadata and the decoded display aspect differ. Fit inside
-  // the requested canvas and pad symmetrically instead: no crop, no corner shrink.
+  // Smart Link native-resolution policy: one source frame maps to one full encoder frame.
+  // No pad, no crop, no 720x1280 envelope. FFmpeg's normal autorotate runs first;
+  // scaling then normalizes the decoded display frame to the exact native canvas.
   const scaleFilter = targetSize?.width && targetSize?.height
-    ? `scale=${targetSize.width}:${targetSize.height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,pad=${targetSize.width}:${targetSize.height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
-    : `scale=${RESOLUTION}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,setsar=1`;
+    ? `scale=${targetSize.width}:${targetSize.height}:flags=lanczos,setsar=1`
+    : `scale=${RESOLUTION}:flags=lanczos,setsar=1`;
   args.push(
     '-fflags', '+genpts',
     '-vf', scaleFilter,
     '-r', '30',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
     '-pix_fmt', 'yuv420p', '-b:v', VIDEO_BITRATE, '-maxrate', VIDEO_BITRATE, '-bufsize', '5000k', '-g', '60',
     '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2'
   );
@@ -829,8 +977,11 @@ function ffmpegForDirect(sourceUrl, container = 'ts') {
 function ffmpegForResolved(resolved, container = 'ts', targetSize = null) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-nostdin'];
   for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input, YTDLP_PROXY));
-  args.push(...ffmpegTranscodeTail(resolved.videoIndex, resolved.audioIndex, container, targetSize));
-  return args;
+  const nativeCopy = canNativeCopy(resolved, container, targetSize);
+  args.push(...(nativeCopy
+    ? ffmpegCopyTail(resolved.videoIndex, resolved.audioIndex)
+    : ffmpegTranscodeTail(resolved.videoIndex, resolved.audioIndex, container, targetSize)));
+  return { args, nativeCopy };
 }
 
 function looksLikeTs(buffer) {
@@ -852,6 +1003,29 @@ function looksLikeFlv(buffer) {
   if ((flags & 0x05) === 0) return false;
   const dataOffset = buffer.readUInt32BE(5);
   return dataOffset >= 9 && dataOffset <= buffer.length;
+}
+
+function looksLikePlayableFlv(buffer) {
+  if (!looksLikeFlv(buffer)) return false;
+  const dataOffset = buffer.readUInt32BE(5);
+  let offset = dataOffset + 4; // Skip PreviousTagSize0.
+  while (offset + 15 <= buffer.length) {
+    const tagType = buffer[offset] & 0x1f;
+    const dataSize = (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3];
+    const dataStart = offset + 11;
+    const dataEnd = dataStart + dataSize;
+    if (dataEnd + 4 > buffer.length) break;
+    if (tagType === 9 && dataSize >= 2) {
+      const videoHeader = buffer[dataStart];
+      const codecId = videoHeader & 0x0f;
+      // H.264/AVC packet type 1 contains actual NAL units. Packet type 0 is
+      // only decoder configuration and is not enough to declare the stream ready.
+      if (codecId === 7 && buffer[dataStart + 1] === 1) return true;
+      if (codecId !== 0 && codecId !== 7) return true;
+    }
+    offset = dataEnd + 4;
+  }
+  return false;
 }
 
 function looksLikeFmp4(buffer) {
@@ -908,7 +1082,7 @@ function probeFfmpegOutput(ff, container, timeoutMs = 25000) {
       }
       if (total < 1024) return;
       const prefix = Buffer.concat(chunks, total);
-      const valid = container === 'flv' ? looksLikeFlv(prefix) : (container === 'fmp4' ? looksLikeFmp4(prefix) : looksLikeTs(prefix));
+      const valid = container === 'flv' ? looksLikePlayableFlv(prefix) : (container === 'fmp4' ? looksLikeFmp4(prefix) : looksLikeTs(prefix));
       if (!valid) return;
 
       settled = true;
@@ -951,7 +1125,7 @@ function smartLinkResolveError(sourceUrl, message) {
   if (platform === 'youtube' && authLike) {
     if (!cookieFile) return {
       code: 'YOUTUBE_AUTH_REQUIRED', needsCookies: true, needsProxy: false,
-      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.7.4 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.7.9 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
     };
     return {
       code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
@@ -985,24 +1159,28 @@ async function handleProbe(req, res, requestUrl) {
   catch (e) { return json(res, 400, { ok: false, error: e.message }); }
   const parsed = new URL(sourceUrl);
   if (!supportedShareHost(parsed.hostname)) {
-    return json(res, 400, { ok: false, error: 'probe-v4 chỉ dùng cho link chia sẻ YouTube/Facebook/TikTok/Vimeo/Instagram' });
+    return json(res, 400, { ok: false, error: 'probe-v5 chỉ dùng cho link chia sẻ YouTube/Facebook/TikTok/Vimeo/Instagram' });
   }
   try {
     const resolved = await resolvePageMedia(sourceUrl);
-    const requestedLong = positiveInt(requestUrl.searchParams.get('long'));
-    const requestedShort = positiveInt(requestUrl.searchParams.get('short'));
-    const longLimit = requestedLong >= 2 && requestedLong <= 2160 ? requestedLong : 1280;
-    const shortLimit = requestedShort >= 2 && requestedShort <= 2160 ? requestedShort : 720;
-    const fitted = fitSourceSize(resolved.sourceWidth, resolved.sourceHeight, longLimit, shortLimit);
+    const native = nativeOutputSize(resolved);
     return json(res, 200, {
       ok: true,
       version: GATEWAY_VERSION,
-      sourceWidth: resolved.sourceWidth,
-      sourceHeight: resolved.sourceHeight,
+      rawWidth: resolved.rawWidth || resolved.sourceWidth,
+      rawHeight: resolved.rawHeight || resolved.sourceHeight,
+      sourceWidth: resolved.displayWidth || resolved.sourceWidth,
+      sourceHeight: resolved.displayHeight || resolved.sourceHeight,
+      displayWidth: native.width,
+      displayHeight: native.height,
+      sar: resolved.sar || '1:1',
+      dar: resolved.dar || `${native.width}:${native.height}`,
       rotation: resolved.rotation || 0,
-      encoderWidth: fitted.width,
-      encoderHeight: fitted.height,
-      aspect: resolved.sourceWidth && resolved.sourceHeight ? resolved.sourceWidth / resolved.sourceHeight : 0
+      geometrySource: resolved.geometrySource || 'unknown',
+      encoderWidth: native.width,
+      encoderHeight: native.height,
+      nativeResolution: true,
+      aspect: native.width / native.height
     });
   } catch (e) {
     const message = String(e?.message || 'Không tách được link').slice(-1600);
@@ -1036,10 +1214,18 @@ async function handleSource(req, res, requestUrl) {
       const resolved = await resolvePageMedia(sourceUrl);
       const requestedW = positiveInt(requestUrl.searchParams.get('w'));
       const requestedH = positiveInt(requestUrl.searchParams.get('h'));
-      outputSize = (requestedW >= 2 && requestedH >= 2 && requestedW <= 1920 && requestedH <= 1920)
-        ? { width: requestedW - (requestedW % 2), height: requestedH - (requestedH % 2) }
-        : fitSourceSize(resolved.sourceWidth, resolved.sourceHeight);
-      ffArgs = ffmpegForResolved(resolved, container, outputSize);
+      const native = nativeOutputSize(resolved);
+      outputSize = (requestedW >= 2 && requestedH >= 2 && requestedW <= 8192 && requestedH <= 8192)
+        ? { width: evenNative(requestedW), height: evenNative(requestedH) }
+        : native;
+      // Do not silently accept a caller canvas that differs from the probed native frame.
+      // Old clients may still send w/h, but v5 clients send exactly these native values.
+      if (requestedW > 0 && requestedH > 0 && (outputSize.width !== native.width || outputSize.height !== native.height)) {
+        console.warn(`[smart-link native] requested ${outputSize.width}x${outputSize.height}, native ${native.width}x${native.height}`);
+      }
+      const ffBuild = ffmpegForResolved(resolved, container, outputSize);
+      ffArgs = ffBuild.args;
+      if (ffBuild.nativeCopy) console.log(`[smart-link native-copy] ${outputSize.width}x${outputSize.height} H.264/AAC remux`);
     } catch (e) {
       const message = String(e?.message || 'Không tách được link').slice(-1600);
       console.error('[smart-link resolve]', message);
@@ -1081,6 +1267,7 @@ async function handleSource(req, res, requestUrl) {
   } catch (e) {
     const message = String(e?.message || 'FFmpeg không tạo được media').slice(-2200);
     console.error('[smart-link ffmpeg probe]', message);
+    if (pageSource) sourceResolveCache.delete(sourceUrl);
     if (!res.destroyed && !res.headersSent) {
       return json(res, 502, {
         ok: false,
@@ -1101,7 +1288,7 @@ async function handleSource(req, res, requestUrl) {
     'x-shoplive-source': pageSource ? 'smart-link-resolved' : 'direct',
     'x-shoplive-container': container,
     'x-shoplive-gateway-version': GATEWAY_VERSION,
-    'x-shoplive-frame-policy': 'fit-pad-no-crop',
+    'x-shoplive-frame-policy': 'native-no-pad-no-crop',
     ...(outputSize ? { 'x-shoplive-width': String(outputSize.width), 'x-shoplive-height': String(outputSize.height) } : {})
   });
   res.write(probe.prefix);
@@ -1111,11 +1298,13 @@ async function handleSource(req, res, requestUrl) {
   ff.stderr.on('data', chunk => console.error('[ffmpeg]', chunk.toString().trim()));
   ff.on('error', err => {
     console.error('[ffmpeg error]', err.message);
+    if (pageSource) sourceResolveCache.delete(sourceUrl);
     if (!res.headersSent) json(res, 500, { ok: false, error: 'ffmpeg unavailable', gatewayVersion: GATEWAY_VERSION });
     else res.destroy(err);
   });
   ff.on('close', code => {
     if (!closed && code !== 0) console.error(`ffmpeg exited ${code}`);
+    if (pageSource && code !== 0) sourceResolveCache.delete(sourceUrl);
     if (!res.writableEnded) res.end();
     closed = true;
   });
@@ -1135,15 +1324,16 @@ const server = http.createServer(async (req, res) => {
     if (requestUrl.pathname === '/api/facebook/live/end' && req.method === 'POST') return await handleFacebookLiveEnd(req, res);
 
     if (requestUrl.pathname === '/healthz') {
-      const [ffmpeg, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ytdlp ? 200 : 503, { ok: ffmpeg && ytdlp, version: GATEWAY_VERSION, node: process.version, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY) });
+      const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffprobe, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY) });
     }
     if (requestUrl.pathname === '/health') {
       if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
-      const [ffmpeg, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ytdlp ? 200 : 503, {
-        ok: ffmpeg && ytdlp,
+      const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, {
+        ok: ffmpeg && ffprobe && ytdlp,
         ffmpeg,
+        ffprobe,
         ytdlp,
         version: GATEWAY_VERSION,
         cookiesConfigured: Boolean(YTDLP_COOKIES_FILE || YOUTUBE_COOKIES_FILE || FACEBOOK_COOKIES_FILE),
@@ -1155,8 +1345,8 @@ const server = http.createServer(async (req, res) => {
         resolution: RESOLUTION.replace(':', 'x')
       });
     }
-    if (requestUrl.pathname === '/api/probe-v4' && req.method === 'GET') return await handleProbe(req, res, requestUrl);
-    if ((requestUrl.pathname === '/api/source' || requestUrl.pathname === '/api/source-v2' || requestUrl.pathname === '/api/source-v3' || requestUrl.pathname === '/api/source-v4') && req.method === 'GET') return await handleSource(req, res, requestUrl);
+    if ((requestUrl.pathname === '/api/probe-v4' || requestUrl.pathname === '/api/probe-v5') && req.method === 'GET') return await handleProbe(req, res, requestUrl);
+    if ((requestUrl.pathname === '/api/source' || requestUrl.pathname === '/api/source-v2' || requestUrl.pathname === '/api/source-v3' || requestUrl.pathname === '/api/source-v4' || requestUrl.pathname === '/api/source-v5') && req.method === 'GET') return await handleSource(req, res, requestUrl);
     return json(res, 404, { ok: false, error: 'not found' });
   } catch (e) {
     console.error(e);
