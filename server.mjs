@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.7.3';
+const GATEWAY_VERSION = '2.7.4';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -682,6 +682,40 @@ function formatToInput(format, fallbackHeaders = {}) {
   };
 }
 
+function positiveInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function resolvedGeometry(info, videoFmt = null) {
+  let width = positiveInt(videoFmt?.width) || positiveInt(info?.width);
+  let height = positiveInt(videoFmt?.height) || positiveInt(info?.height);
+  const rotation = ((positiveInt(videoFmt?.rotation) || positiveInt(info?.rotation)) % 360 + 360) % 360;
+  if ((!width || !height) && Array.isArray(info?.formats)) {
+    const candidates = info.formats
+      .filter(f => f && f.vcodec && f.vcodec !== 'none' && positiveInt(f.width) && positiveInt(f.height))
+      .sort((a, b) => (positiveInt(b.width) * positiveInt(b.height)) - (positiveInt(a.width) * positiveInt(a.height)));
+    if (candidates.length) {
+      width = positiveInt(candidates[0].width);
+      height = positiveInt(candidates[0].height);
+    }
+  }
+  if (rotation === 90 || rotation === 270) [width, height] = [height, width];
+  return { sourceWidth: width, sourceHeight: height, rotation };
+}
+
+function fitSourceSize(width, height, longLimit = 1280, shortLimit = 720) {
+  const w = positiveInt(width);
+  const h = positiveInt(height);
+  if (!w || !h) return { width: 720, height: 1280 };
+  const landscape = w >= h;
+  const maxW = landscape ? longLimit : shortLimit;
+  const maxH = landscape ? shortLimit : longLimit;
+  const scale = Math.min(maxW / w, maxH / h, 1);
+  const even = value => Math.max(2, Math.round(value / 2) * 2);
+  return { width: even(w * scale), height: even(h * scale) };
+}
+
 function pickResolvedInputs(info) {
   const baseHeaders = safeHttpHeaders(info?.http_headers || {});
   const requested = Array.isArray(info?.requested_formats) ? info.requested_formats : [];
@@ -693,14 +727,15 @@ function pickResolvedInputs(info) {
     const video = formatToInput(videoFmt, baseHeaders);
     const audio = formatToInput(audioFmt, baseHeaders);
     if (!video) throw new Error('yt-dlp không trả URL video có thể phát');
-    if (audio && audio.url !== video.url) return { inputs: [video, audio], videoIndex: 0, audioIndex: 1 };
-    return { inputs: [video], videoIndex: 0, audioIndex: audio ? 0 : null };
+    const geometry = resolvedGeometry(info, videoFmt);
+    if (audio && audio.url !== video.url) return { inputs: [video, audio], videoIndex: 0, audioIndex: 1, ...geometry };
+    return { inputs: [video], videoIndex: 0, audioIndex: audio ? 0 : null, ...geometry };
   }
 
   const combined = formatToInput(info, baseHeaders);
   if (!combined) throw new Error('yt-dlp không trả URL media có thể phát');
   const hasAudio = info?.acodec && info.acodec !== 'none';
-  return { inputs: [combined], videoIndex: 0, audioIndex: hasAudio ? 0 : null };
+  return { inputs: [combined], videoIndex: 0, audioIndex: hasAudio ? 0 : null, ...resolvedGeometry(info, info) };
 }
 
 async function resolvePageMedia(sourceUrl) {
@@ -737,15 +772,18 @@ function ffmpegInputArgs(input) {
   return args;
 }
 
-function ffmpegTranscodeTail(videoIndex = 0, audioIndex = 0, container = 'ts') {
+function ffmpegTranscodeTail(videoIndex = 0, audioIndex = 0, container = 'ts', targetSize = null) {
   const args = [
     '-map', `${videoIndex}:v:0`,
   ];
   if (audioIndex === null || audioIndex === undefined) args.push('-map', `${videoIndex}:a:0?`);
   else args.push('-map', `${audioIndex}:a:0?`);
+  const scaleFilter = targetSize?.width && targetSize?.height
+    ? `scale=${targetSize.width}:${targetSize.height}:flags=lanczos,setsar=1`
+    : `scale=${RESOLUTION}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`;
   args.push(
     '-fflags', '+genpts',
-    '-vf', `scale=${RESOLUTION}:force_original_aspect_ratio=decrease,pad=${RESOLUTION}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+    '-vf', scaleFilter,
     '-r', '30',
     '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
     '-pix_fmt', 'yuv420p', '-b:v', VIDEO_BITRATE, '-maxrate', VIDEO_BITRATE, '-bufsize', '5000k', '-g', '60',
@@ -777,10 +815,10 @@ function ffmpegForDirect(sourceUrl, container = 'ts') {
   ];
 }
 
-function ffmpegForResolved(resolved, container = 'ts') {
+function ffmpegForResolved(resolved, container = 'ts', targetSize = null) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-nostdin'];
   for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input));
-  args.push(...ffmpegTranscodeTail(resolved.videoIndex, resolved.audioIndex, container));
+  args.push(...ffmpegTranscodeTail(resolved.videoIndex, resolved.audioIndex, container, targetSize));
   return args;
 }
 
@@ -902,7 +940,7 @@ function smartLinkResolveError(sourceUrl, message) {
   if (platform === 'youtube' && authLike) {
     if (!cookieFile) return {
       code: 'YOUTUBE_AUTH_REQUIRED', needsCookies: true, needsProxy: false,
-      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.7.3 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.7.4 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
     };
     return {
       code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
@@ -927,6 +965,45 @@ function smartLinkResolveError(sourceUrl, message) {
   };
 }
 
+async function handleProbe(req, res, requestUrl) {
+  if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
+  const raw = requestUrl.searchParams.get('url');
+  if (!raw) return json(res, 400, { ok: false, error: 'missing url' });
+  let sourceUrl;
+  try { sourceUrl = await safePublicUrl(raw); }
+  catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+  const parsed = new URL(sourceUrl);
+  if (!supportedShareHost(parsed.hostname)) {
+    return json(res, 400, { ok: false, error: 'probe-v4 chỉ dùng cho link chia sẻ YouTube/Facebook/TikTok/Vimeo/Instagram' });
+  }
+  try {
+    const resolved = await resolvePageMedia(sourceUrl);
+    const requestedLong = positiveInt(requestUrl.searchParams.get('long'));
+    const requestedShort = positiveInt(requestUrl.searchParams.get('short'));
+    const longLimit = requestedLong >= 2 && requestedLong <= 2160 ? requestedLong : 1280;
+    const shortLimit = requestedShort >= 2 && requestedShort <= 2160 ? requestedShort : 720;
+    const fitted = fitSourceSize(resolved.sourceWidth, resolved.sourceHeight, longLimit, shortLimit);
+    return json(res, 200, {
+      ok: true,
+      version: GATEWAY_VERSION,
+      sourceWidth: resolved.sourceWidth,
+      sourceHeight: resolved.sourceHeight,
+      rotation: resolved.rotation || 0,
+      encoderWidth: fitted.width,
+      encoderHeight: fitted.height,
+      aspect: resolved.sourceWidth && resolved.sourceHeight ? resolved.sourceWidth / resolved.sourceHeight : 0
+    });
+  } catch (e) {
+    const message = String(e?.message || 'Không tách được link').slice(-1600);
+    const classified = smartLinkResolveError(sourceUrl, message);
+    return json(res, 502, {
+      ok: false, code: classified.code, error: message, gatewayVersion: GATEWAY_VERSION,
+      platform: extractorPlatform(sourceUrl), needsCookies: classified.needsCookies,
+      needsProxy: classified.needsProxy, hint: classified.hint
+    });
+  }
+}
+
 async function handleSource(req, res, requestUrl) {
   if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
   const raw = requestUrl.searchParams.get('url');
@@ -942,10 +1019,16 @@ async function handleSource(req, res, requestUrl) {
   const parsed = new URL(sourceUrl);
   const pageSource = supportedShareHost(parsed.hostname);
   let ffArgs;
+  let outputSize = null;
   if (pageSource) {
     try {
       const resolved = await resolvePageMedia(sourceUrl);
-      ffArgs = ffmpegForResolved(resolved, container);
+      const requestedW = positiveInt(requestUrl.searchParams.get('w'));
+      const requestedH = positiveInt(requestUrl.searchParams.get('h'));
+      outputSize = (requestedW >= 2 && requestedH >= 2 && requestedW <= 1920 && requestedH <= 1920)
+        ? { width: requestedW - (requestedW % 2), height: requestedH - (requestedH % 2) }
+        : fitSourceSize(resolved.sourceWidth, resolved.sourceHeight);
+      ffArgs = ffmpegForResolved(resolved, container, outputSize);
     } catch (e) {
       const message = String(e?.message || 'Không tách được link').slice(-1600);
       console.error('[smart-link resolve]', message);
@@ -1006,7 +1089,8 @@ async function handleSource(req, res, requestUrl) {
     'connection': 'keep-alive',
     'x-shoplive-source': pageSource ? 'smart-link-resolved' : 'direct',
     'x-shoplive-container': container,
-    'x-shoplive-gateway-version': GATEWAY_VERSION
+    'x-shoplive-gateway-version': GATEWAY_VERSION,
+    ...(outputSize ? { 'x-shoplive-width': String(outputSize.width), 'x-shoplive-height': String(outputSize.height) } : {})
   });
   res.write(probe.prefix);
 
@@ -1059,7 +1143,8 @@ const server = http.createServer(async (req, res) => {
         resolution: RESOLUTION.replace(':', 'x')
       });
     }
-    if ((requestUrl.pathname === '/api/source' || requestUrl.pathname === '/api/source-v2' || requestUrl.pathname === '/api/source-v3') && req.method === 'GET') return await handleSource(req, res, requestUrl);
+    if (requestUrl.pathname === '/api/probe-v4' && req.method === 'GET') return await handleProbe(req, res, requestUrl);
+    if ((requestUrl.pathname === '/api/source' || requestUrl.pathname === '/api/source-v2' || requestUrl.pathname === '/api/source-v3' || requestUrl.pathname === '/api/source-v4') && req.method === 'GET') return await handleSource(req, res, requestUrl);
     return json(res, 404, { ok: false, error: 'not found' });
   } catch (e) {
     console.error(e);
