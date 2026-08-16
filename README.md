@@ -1,4 +1,4 @@
-# ShopLive AI Smart Link Gateway 2.7.4
+# ShopLive AI Smart Link Gateway 2.7.6
 
 Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn khi cần, sau đó FFmpeg chuẩn hóa thành H.264/AAC HTTP-FLV cho Android.
 
@@ -8,7 +8,7 @@ Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn
 - `GET /health?key=<KEY>` — health chi tiết.
 - `GET /api/source-v3?key=<KEY>&container=flv&url=<URL_ENCODED>` — Smart Link hiện tại.
 
-## Điểm mới 2.7.4
+## Điểm mới 2.7.6
 
 - Docker dùng Node 22.
 - Cài `yt-dlp[default,curl-cffi]` để có EJS challenge scripts và browser impersonation.

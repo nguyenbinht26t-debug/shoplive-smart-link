@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.7.4';
+const GATEWAY_VERSION = '2.7.6';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -778,9 +778,12 @@ function ffmpegTranscodeTail(videoIndex = 0, audioIndex = 0, container = 'ts', t
   ];
   if (audioIndex === null || audioIndex === undefined) args.push('-map', `${videoIndex}:a:0?`);
   else args.push('-map', `${audioIndex}:a:0?`);
+  // Preserve the complete source frame. Exact scale=w:h stretches odd Facebook
+  // sources when yt-dlp metadata and the decoded display aspect differ. Fit inside
+  // the requested canvas and pad symmetrically instead: no crop, no corner shrink.
   const scaleFilter = targetSize?.width && targetSize?.height
-    ? `scale=${targetSize.width}:${targetSize.height}:flags=lanczos,setsar=1`
-    : `scale=${RESOLUTION}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`;
+    ? `scale=${targetSize.width}:${targetSize.height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,pad=${targetSize.width}:${targetSize.height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
+    : `scale=${RESOLUTION}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,setsar=1`;
   args.push(
     '-fflags', '+genpts',
     '-vf', scaleFilter,
@@ -1090,6 +1093,7 @@ async function handleSource(req, res, requestUrl) {
     'x-shoplive-source': pageSource ? 'smart-link-resolved' : 'direct',
     'x-shoplive-container': container,
     'x-shoplive-gateway-version': GATEWAY_VERSION,
+    'x-shoplive-frame-policy': 'fit-pad-no-crop',
     ...(outputSize ? { 'x-shoplive-width': String(outputSize.width), 'x-shoplive-height': String(outputSize.height) } : {})
   });
   res.write(probe.prefix);
