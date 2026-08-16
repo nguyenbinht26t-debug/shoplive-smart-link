@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.7.6';
+const GATEWAY_VERSION = '2.7.7';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -761,11 +761,19 @@ function ffmpegHeaderValue(headers) {
   return entries.map(([key, value]) => `${key}: ${value}\r\n`).join('');
 }
 
-function ffmpegInputArgs(input) {
+function ffmpegInputArgs(input, proxyUrl = '') {
   const args = [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-rw_timeout', '15000000'
   ];
+  // yt-dlp signs Googlevideo/Meta CDN URLs for the IP that extracted them. When
+  // extraction uses YTDLP_PROXY, FFmpeg must fetch every resolved input through
+  // the same proxy as well; otherwise the CDN sees Render's IP and returns 403.
+  // This is an FFmpeg input option, so it must appear before each corresponding -i.
+  const normalizedProxy = String(proxyUrl || '').trim();
+  if (normalizedProxy && /^https?:\/\//i.test(input.url)) {
+    args.push('-http_proxy', normalizedProxy);
+  }
   const headerValue = ffmpegHeaderValue(input.headers);
   if (headerValue) args.push('-headers', headerValue);
   args.push('-i', input.url);
@@ -820,7 +828,7 @@ function ffmpegForDirect(sourceUrl, container = 'ts') {
 
 function ffmpegForResolved(resolved, container = 'ts', targetSize = null) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-nostdin'];
-  for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input));
+  for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input, YTDLP_PROXY));
   args.push(...ffmpegTranscodeTail(resolved.videoIndex, resolved.audioIndex, container, targetSize));
   return args;
 }
