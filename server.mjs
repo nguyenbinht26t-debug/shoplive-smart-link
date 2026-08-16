@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.7.0';
+const GATEWAY_VERSION = '2.7.3';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -32,15 +32,32 @@ const RESOLUTION = process.env.RESOLUTION || '720:1280';
 const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '2500k';
 let YTDLP_COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || '').trim();
 const YTDLP_COOKIES_B64 = (process.env.YTDLP_COOKIES_B64 || '').trim();
-if (!YTDLP_COOKIES_FILE && YTDLP_COOKIES_B64) {
+const YOUTUBE_COOKIES_B64 = (process.env.YOUTUBE_COOKIES_B64 || '').trim();
+const FACEBOOK_COOKIES_B64 = (process.env.FACEBOOK_COOKIES_B64 || '').trim();
+const YTDLP_PROXY = (process.env.YTDLP_PROXY || '').trim();
+const YTDLP_IMPERSONATE = (process.env.YTDLP_IMPERSONATE || '').trim();
+const YOUTUBE_PLAYER_CLIENTS = (process.env.YOUTUBE_PLAYER_CLIENTS || '').trim();
+
+function cookieFileFromBase64(value, filename, label) {
+  if (!value) return '';
   try {
-    YTDLP_COOKIES_FILE = '/tmp/shoplive-ytdlp-cookies.txt';
-    fs.writeFileSync(YTDLP_COOKIES_FILE, Buffer.from(YTDLP_COOKIES_B64, 'base64'), { mode: 0o600 });
+    const file = `/tmp/${filename}`;
+    const decoded = Buffer.from(value, 'base64');
+    if (!decoded.length) throw new Error('cookie data is empty');
+    fs.writeFileSync(file, decoded, { mode: 0o600 });
+    console.log(`[yt-dlp cookies] loaded ${label} cookie file (${decoded.length} bytes)`);
+    return file;
   } catch (e) {
-    console.error('[yt-dlp cookies] cannot decode YTDLP_COOKIES_B64:', e.message);
-    YTDLP_COOKIES_FILE = '';
+    console.error(`[yt-dlp cookies] cannot decode ${label}:`, e.message);
+    return '';
   }
 }
+
+if (!YTDLP_COOKIES_FILE && YTDLP_COOKIES_B64) {
+  YTDLP_COOKIES_FILE = cookieFileFromBase64(YTDLP_COOKIES_B64, 'shoplive-ytdlp-cookies.txt', 'YTDLP_COOKIES_B64');
+}
+const YOUTUBE_COOKIES_FILE = cookieFileFromBase64(YOUTUBE_COOKIES_B64, 'shoplive-youtube-cookies.txt', 'YOUTUBE_COOKIES_B64');
+const FACEBOOK_COOKIES_FILE = cookieFileFromBase64(FACEBOOK_COOKIES_B64, 'shoplive-facebook-cookies.txt', 'FACEBOOK_COOKIES_B64');
 
 // OAuth account connection broker. Provider app secrets stay on the Gateway, never in the APK.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
@@ -575,18 +592,49 @@ async function safePublicUrl(raw) {
 
 const sourceResolveCache = new Map();
 
+function extractorPlatform(sourceUrl) {
+  const host = new URL(sourceUrl).hostname.toLowerCase().replace(/^www\./, '');
+  if (host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com')) return 'youtube';
+  if (host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'fb.watch') return 'facebook';
+  if (host === 'instagram.com' || host.endsWith('.instagram.com')) return 'instagram';
+  if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) return 'tiktok';
+  return 'other';
+}
+
+function cookieFileForPlatform(platform) {
+  if (platform === 'youtube' && YOUTUBE_COOKIES_FILE) return YOUTUBE_COOKIES_FILE;
+  if ((platform === 'facebook' || platform === 'instagram') && FACEBOOK_COOKIES_FILE) return FACEBOOK_COOKIES_FILE;
+  return YTDLP_COOKIES_FILE;
+}
+
 function ytdlpJsonArgs(sourceUrl) {
-  // Resolve the webpage first instead of piping yt-dlp's downloaded file to ffmpeg. This lets
-  // yt-dlp select separate best video + best audio streams (common on YouTube) while ffmpeg reads
-  // both CDN URLs directly and transcodes them in real time.
+  // yt-dlp 2026 YouTube extraction needs an external JS runtime/EJS challenge solver.
+  // The Gateway image uses Node 22 and yt-dlp[default,curl-cffi]; explicitly enable Node
+  // so extraction is not silently degraded when YouTube changes its JS challenges.
+  const platform = extractorPlatform(sourceUrl);
   const args = [
     '--no-playlist', '--no-progress', '--no-warnings',
-    '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2',
+    '--js-runtimes', 'node',
+    '--socket-timeout', '20', '--retries', '3', '--fragment-retries', '3', '--extractor-retries', '3',
     '--skip-download', '--dump-single-json',
-    '-f', 'bv*[height<=1080]+ba/b[height<=1080]/best',
-    sourceUrl
+    '-f', 'bv*[height<=1080]+ba/b[height<=1080]/best'
   ];
-  if (YTDLP_COOKIES_FILE) args.unshift('--cookies', YTDLP_COOKIES_FILE);
+
+  const cookieFile = cookieFileForPlatform(platform);
+  if (cookieFile) args.push('--cookies', cookieFile);
+  if (YTDLP_PROXY) args.push('--proxy', YTDLP_PROXY);
+
+  // curl_cffi is installed so extractors that need browser impersonation (notably Meta sites)
+  // can use it. Do not force impersonation globally because some sites work worse when forced.
+  if (YTDLP_IMPERSONATE) args.push('--impersonate', YTDLP_IMPERSONATE);
+  else if (platform === 'facebook' || platform === 'instagram') args.push('--impersonate', 'chrome');
+
+  // Optional escape hatch for future YouTube client changes without rebuilding the Gateway.
+  if (platform === 'youtube' && YOUTUBE_PLAYER_CLIENTS) {
+    args.push('--extractor-args', `youtube:player_client=${YOUTUBE_PLAYER_CLIENTS}`);
+  }
+
+  args.push(sourceUrl);
   return args;
 }
 
@@ -595,10 +643,10 @@ function runYtDlpJson(sourceUrl) {
     execFile(
       YTDLP,
       ytdlpJsonArgs(sourceUrl),
-      { timeout: 35_000, maxBuffer: 12 * 1024 * 1024, windowsHide: true },
+      { timeout: 50_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
       (error, stdout, stderr) => {
         if (error) {
-          const detail = String(stderr || error.message || 'yt-dlp failed').trim().slice(-1400);
+          const detail = String(stderr || error.message || 'yt-dlp failed').trim().slice(-2200);
           return reject(new Error(detail || 'yt-dlp failed'));
         }
         try {
@@ -844,6 +892,41 @@ function probeFfmpegOutput(ff, container, timeoutMs = 25000) {
   });
 }
 
+function smartLinkResolveError(sourceUrl, message) {
+  const platform = extractorPlatform(sourceUrl);
+  const lower = String(message || '').toLowerCase();
+  const authLike = /sign in|log in|login|cookies?|not a bot|confirm you(?:'|’)re not a bot|authentication|private video|members-only|age-restricted/.test(lower);
+  const forbidden = /http error 403|forbidden|429|too many requests/.test(lower);
+  const cookieFile = cookieFileForPlatform(platform);
+
+  if (platform === 'youtube' && authLike) {
+    if (!cookieFile) return {
+      code: 'YOUTUBE_AUTH_REQUIRED', needsCookies: true, needsProxy: false,
+      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.7.3 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+    };
+    return {
+      code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
+      hint: 'Cookie YouTube đã được nạp nhưng YouTube vẫn chặn phiên/IP máy chủ Render. Hãy làm mới cookie; nếu vẫn lỗi, cấu hình YTDLP_PROXY bằng proxy hợp lệ.'
+    };
+  }
+  if (platform === 'youtube' && forbidden) return {
+    code: 'YOUTUBE_403', needsCookies: !cookieFile, needsProxy: Boolean(cookieFile),
+    hint: cookieFile
+      ? 'YouTube trả 403 dù đã có cookie; làm mới cookie hoặc dùng YTDLP_PROXY.'
+      : 'YouTube trả 403; cấu hình YOUTUBE_COOKIES_B64 trước.'
+  };
+  if ((platform === 'facebook' || platform === 'instagram') && authLike) return {
+    code: 'META_AUTH_REQUIRED', needsCookies: !cookieFile, needsProxy: false,
+    hint: cookieFile
+      ? 'Facebook/Instagram vẫn yêu cầu đăng nhập; hãy xuất lại cookie tài khoản có quyền xem video.'
+      : 'Facebook/Instagram yêu cầu đăng nhập. Cấu hình FACEBOOK_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+  };
+  return {
+    code: 'EXTRACTOR_FAILED', needsCookies: false, needsProxy: false,
+    hint: 'Không tách được link. Kiểm tra video còn công khai, không DRM và xem Render logs để biết chi tiết.'
+  };
+}
+
 async function handleSource(req, res, requestUrl) {
   if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
   const raw = requestUrl.searchParams.get('url');
@@ -866,13 +949,16 @@ async function handleSource(req, res, requestUrl) {
     } catch (e) {
       const message = String(e?.message || 'Không tách được link').slice(-1600);
       console.error('[smart-link resolve]', message);
+      const classified = smartLinkResolveError(sourceUrl, message);
       return json(res, 502, {
         ok: false,
+        code: classified.code,
         error: message,
         gatewayVersion: GATEWAY_VERSION,
-        hint: /cookie|sign in|bot|login/i.test(message)
-          ? 'Nguồn yêu cầu đăng nhập/chống bot. Cấu hình YTDLP_COOKIES_B64 trên Gateway rồi deploy lại.'
-          : 'Không tách được link công khai. Kiểm tra link còn xem được và không DRM.'
+        platform: extractorPlatform(sourceUrl),
+        needsCookies: classified.needsCookies,
+        needsProxy: classified.needsProxy,
+        hint: classified.hint
       });
     }
   } else {
@@ -954,7 +1040,7 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/healthz') {
       const [ffmpeg, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ytdlp ? 200 : 503, { ok: ffmpeg && ytdlp, version: GATEWAY_VERSION });
+      return json(res, ffmpeg && ytdlp ? 200 : 503, { ok: ffmpeg && ytdlp, version: GATEWAY_VERSION, node: process.version, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY) });
     }
     if (requestUrl.pathname === '/health') {
       if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
@@ -964,7 +1050,12 @@ const server = http.createServer(async (req, res) => {
         ffmpeg,
         ytdlp,
         version: GATEWAY_VERSION,
-        cookiesConfigured: Boolean(YTDLP_COOKIES_FILE),
+        cookiesConfigured: Boolean(YTDLP_COOKIES_FILE || YOUTUBE_COOKIES_FILE || FACEBOOK_COOKIES_FILE),
+        youtubeCookiesConfigured: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE),
+        facebookCookiesConfigured: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE),
+        proxyConfigured: Boolean(YTDLP_PROXY),
+        node: process.version,
+        jsRuntime: 'node',
         resolution: RESOLUTION.replace(':', 'x')
       });
     }

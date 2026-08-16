@@ -1,25 +1,21 @@
-# ShopLive AI Smart Link Gateway 2.6.9
+# ShopLive AI Smart Link Gateway 2.7.3
 
-Gateway nhận URL công khai/không DRM, dùng yt-dlp khi cần, sau đó FFmpeg chuẩn hóa thành H.264/AAC để Android phát và encode lại lên nền tảng Live.
+Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn khi cần, sau đó FFmpeg chuẩn hóa thành H.264/AAC HTTP-FLV cho Android.
 
 ## Endpoint
 
-Health:
+- `GET /healthz` — kiểm tra phiên bản, Node, trạng thái cookie/proxy.
+- `GET /health?key=<KEY>` — health chi tiết.
+- `GET /api/source-v3?key=<KEY>&container=flv&url=<URL_ENCODED>` — Smart Link hiện tại.
 
-`GET /health`
+## Điểm mới 2.7.3
 
-Smart Link 2.6.9:
-
-`GET /api/source-v2?key=<KEY>&container=fmp4&url=<URL_ENCODED>`
-
-Endpoint `/api/source` vẫn giữ cho client cũ. App 2.6.9 chủ động dùng `/api/source-v2` để phát hiện ngay trường hợp Render chưa được cập nhật.
-
-## Điểm mới 2.6.9
-
-- fMP4 (`video/mp4`) là container mặc định được app 2.6.9 yêu cầu.
-- HTTP 200 chỉ được gửi sau khi FFmpeg thực sự tạo media init hợp lệ.
-- Lỗi yt-dlp/FFmpeg trả HTTP 502 JSON để Android hiển thị nguyên nhân thật.
-- Response có `x-shoplive-gateway-version` và `x-shoplive-container`.
+- Docker dùng Node 22.
+- Cài `yt-dlp[default,curl-cffi]` để có EJS challenge scripts và browser impersonation.
+- yt-dlp bật rõ `--js-runtimes node`.
+- Cookie riêng: `YOUTUBE_COOKIES_B64`, `FACEBOOK_COOKIES_B64`; `YTDLP_COOKIES_B64` là fallback chung.
+- `YTDLP_PROXY` là tùy chọn khi YouTube chặn IP datacenter của Render.
+- Lỗi trả mã rõ ràng như `YOUTUBE_AUTH_REQUIRED`, `YOUTUBE_IP_OR_SESSION_BLOCKED`, `META_AUTH_REQUIRED`.
 
 ## Docker
 
@@ -30,15 +26,10 @@ docker run --rm -p 8787:8787 \
   shoplive-smart-link
 ```
 
-Dockerfile cài FFmpeg và cập nhật yt-dlp khi build image.
+## Cookie
 
-## Cookies tùy chọn
-
-Một số link YouTube/Facebook có thể yêu cầu đăng nhập/chống bot. Gateway hỗ trợ `YTDLP_COOKIES_B64`; không đặt cookie trong APK.
+Cookie phải là file `cookies.txt` định dạng Netscape được Base64 rồi lưu trong Render Environment. Không commit cookie lên GitHub và không nhúng vào APK.
 
 ## An toàn
 
-- Dùng HTTPS ở production.
-- Đặt API key mạnh và giữ biến môi trường ở server.
-- Chỉ phát nội dung bạn sở hữu hoặc có quyền sử dụng.
-- Không hỗ trợ DRM/paywall/private content khi Gateway không có quyền truy cập.
+Chỉ phát nội dung bạn sở hữu hoặc có quyền phát lại. Gateway không vượt DRM/paywall.
