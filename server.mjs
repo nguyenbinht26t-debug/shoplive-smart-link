@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.8.4';
+const GATEWAY_VERSION = '2.8.5';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -395,8 +395,12 @@ function keyOk(req, requestUrl) {
 }
 
 function commandExists(command) {
+  const executable = path.basename(String(command || '')).toLowerCase();
+  const versionArg = executable.startsWith('ffmpeg') || executable.startsWith('ffprobe')
+    ? '-version'
+    : '--version';
   return new Promise(resolve => {
-    execFile(command, ['--version'], { timeout: 4000 }, error => resolve(!error));
+    execFile(command, [versionArg], { timeout: 4000 }, error => resolve(!error));
   });
 }
 
@@ -1548,7 +1552,7 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/healthz') {
       const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffprobe, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY), youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE, youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default' });
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffmpeg, ffprobe, ytdlp, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY), youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE, youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default' });
     }
     if (requestUrl.pathname === '/health') {
       if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });

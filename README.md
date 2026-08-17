@@ -1,4 +1,4 @@
-# ShopLive AI Smart Link Gateway 2.8.4
+# ShopLive AI Smart Link Gateway 2.8.5
 
 Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn khi cần, sau đó FFmpeg chuẩn hóa thành H.264/AAC HTTP-FLV cho Android.
 
@@ -8,7 +8,13 @@ Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn
 - `GET /health?key=<KEY>` — health chi tiết.
 - `GET /api/source-v3?key=<KEY>&container=flv&url=<URL_ENCODED>` — Smart Link hiện tại.
 
-## Điểm mới 2.8.4
+## Điểm mới 2.8.5
+
+- Sửa health check FFmpeg/FFprobe dùng đúng tham số `-version`; bản 2.8.4 trước đó báo `ok: false` và `ffprobe: false` giả dù chương trình đã được cài.
+- `/healthz` hiển thị riêng cả `ffmpeg`, `ffprobe` và `ytdlp` để dễ xác định thành phần nào thực sự thiếu.
+- Không thay đổi PO Token, cookie, proxy, chất lượng tối đa 1080p hoặc luồng H.264/AAC.
+
+## Nền tảng 2.8.4
 
 - Tích hợp PO Token provider 1.3.1 cho YouTube Live/DASH ngay trong Docker.
 - Tự ưu tiên client `mweb` khi provider sẵn sàng, giúp yt-dlp nhận lại các định dạng livestream bị YouTube ẩn khi thiếu GVS PO Token.
