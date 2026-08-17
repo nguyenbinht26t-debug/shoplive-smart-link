@@ -1,4 +1,4 @@
-# ShopLive AI Smart Link Gateway 2.8.1
+# ShopLive AI Smart Link Gateway 2.8.4
 
 Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn khi cần, sau đó FFmpeg chuẩn hóa thành H.264/AAC HTTP-FLV cho Android.
 
@@ -8,7 +8,30 @@ Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn
 - `GET /health?key=<KEY>` — health chi tiết.
 - `GET /api/source-v3?key=<KEY>&container=flv&url=<URL_ENCODED>` — Smart Link hiện tại.
 
-## Điểm mới 2.8.1
+## Điểm mới 2.8.4
+
+- Tích hợp PO Token provider 1.3.1 cho YouTube Live/DASH ngay trong Docker.
+- Tự ưu tiên client `mweb` khi provider sẵn sàng, giúp yt-dlp nhận lại các định dạng livestream bị YouTube ẩn khi thiếu GVS PO Token.
+- PO generator, yt-dlp, FFprobe và FFmpeg dùng cùng `YTDLP_PROXY`, tránh token/URL ký bị lệch IP.
+- `/healthz` trả thêm `youtubePoProvider` và `youtubePlayerClients`; sau deploy đúng phải thấy `youtubePoProvider: true` và phiên bản `2.8.4`.
+- Phân biệt rõ livestream chưa bắt đầu (`YOUTUBE_LIVE_NOT_STARTED`) với lỗi cấp PO Token (`YOUTUBE_PO_TOKEN_FAILED`).
+- Lần Docker build đầu sẽ lâu hơn trước vài phút vì phải biên dịch PO provider; các lần build có cache sẽ nhanh hơn.
+
+## Nền tảng 2.8.3
+
+- Sửa lỗi Android Media3 `ArrayIndexOutOfBoundsException: length=0; index=0` sau khi Gateway đã probe được video.
+- Nhánh nhẹ vẫn copy trực tiếp hình H.264 1080p, nhưng luôn dựng lại âm thanh thành AAC-LC 44.1 kHz stereo 128 kbps.
+- Không cần xuất lại cookie khi probe đã trả đúng kích thước và lỗi chỉ xuất hiện ở bước Media3 mở HTTP-FLV.
+
+## Nền tảng 2.8.2
+
+- Chọn nguồn tối đa 1080p ngay từ yt-dlp: ngang tối đa `1920x1080`, dọc tối đa `1080x1920`.
+- Video 2K/4K được giới hạn về khung 1080p nhưng giữ nguyên tỷ lệ; không crop, không pad, không kéo méo.
+- Video vốn thấp hơn 1080p giữ nguyên kích thước, không phóng lớn làm nhòe.
+- Bỏ `-re` ở đầu vào, tăng hàng đợi lên 4096 và timeout mạng lên 30 giây để Gateway nạp buffer nhanh hơn.
+- Ưu tiên H.264/AAC để remux trực tiếp sang HTTP-FLV, giảm tải mã hóa lại trên Render.
+
+## Nền tảng 2.8.1
 
 - `YTDLP_PROXY` chỉ áp dụng cho YouTube; proxy YouTube hết hạn không còn làm hỏng link Facebook/TikTok.
 - Có thể cấu hình `META_PROXY` riêng nếu Facebook/Instagram thực sự cần proxy.

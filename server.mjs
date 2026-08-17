@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.8.1';
+const GATEWAY_VERSION = '2.8.4';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -31,6 +31,10 @@ const FFPROBE = process.env.FFPROBE || 'ffprobe';
 const YTDLP = process.env.YTDLP || 'yt-dlp';
 const RESOLUTION = process.env.RESOLUTION || '720:1280';
 const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '2500k';
+// 1080p envelope that works for both orientations without cropping:
+// landscape <= 1920x1080, portrait <= 1080x1920, square <= 1080x1080.
+const SMART_LINK_MAX_SHORT_EDGE = 1080;
+const SMART_LINK_MAX_LONG_EDGE = 1920;
 let YTDLP_COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || '').trim();
 const YTDLP_COOKIES_B64 = (process.env.YTDLP_COOKIES_B64 || '').trim();
 const YOUTUBE_COOKIES_B64 = (process.env.YOUTUBE_COOKIES_B64 || '').trim();
@@ -39,6 +43,21 @@ const YTDLP_PROXY = (process.env.YTDLP_PROXY || '').trim();
 const META_PROXY = (process.env.META_PROXY || '').trim();
 const YTDLP_IMPERSONATE = (process.env.YTDLP_IMPERSONATE || '').trim();
 const YOUTUBE_PLAYER_CLIENTS = (process.env.YOUTUBE_PLAYER_CLIENTS || '').trim();
+const YOUTUBE_PO_PROVIDER_HOME = (process.env.YOUTUBE_PO_PROVIDER_HOME || '/opt/bgutil-ytdlp-pot-provider/server').trim();
+const YOUTUBE_PO_PROVIDER_AVAILABLE = Boolean(YOUTUBE_PO_PROVIDER_HOME && fs.existsSync(YOUTUBE_PO_PROVIDER_HOME));
+
+function effectiveYoutubePlayerClients() {
+  const clients = YOUTUBE_PLAYER_CLIENTS
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  // yt-dlp recommends mweb when a PO Token is available. Prepend it even if
+  // an older Render variable still contains web_safari/web_embedded.
+  if (YOUTUBE_PO_PROVIDER_AVAILABLE && !clients.includes('mweb')) clients.unshift('mweb');
+  return [...new Set(clients)].join(',');
+}
+
+const EFFECTIVE_YOUTUBE_PLAYER_CLIENTS = effectiveYoutubePlayerClients();
 
 function cookieFileFromBase64(value, filename, label) {
   if (!value) return '';
@@ -617,6 +636,25 @@ function proxyForPlatform(platform) {
   return '';
 }
 
+function ytdlpProcessEnv(sourceUrl) {
+  const platform = extractorPlatform(sourceUrl);
+  const platformProxy = proxyForPlatform(platform);
+  if (platform !== 'youtube' || !platformProxy) return process.env;
+
+  // Provider 1.3.1 forwards environment variables to its JavaScript runtime.
+  // Give the PO generator the same outbound proxy as yt-dlp so the token,
+  // manifest and signed Googlevideo URL all originate from one exit IP.
+  return {
+    ...process.env,
+    HTTP_PROXY: platformProxy,
+    HTTPS_PROXY: platformProxy,
+    ALL_PROXY: platformProxy,
+    http_proxy: platformProxy,
+    https_proxy: platformProxy,
+    all_proxy: platformProxy
+  };
+}
+
 function liveStatusFromInfo(info) {
   const status = String(info?.live_status || '').trim().toLowerCase();
   const isLive = info?.is_live === true || status === 'is_live' || status === 'live';
@@ -629,7 +667,7 @@ function ytdlpJsonArgs(sourceUrl) {
   // so extraction is not silently degraded when YouTube changes its JS challenges.
   const platform = extractorPlatform(sourceUrl);
   const args = [
-    '--no-playlist', '--no-progress', '--no-warnings',
+    '--no-playlist', '--no-progress',
     '--js-runtimes', 'node',
     '--socket-timeout', '20', '--retries', '3', '--fragment-retries', '3', '--extractor-retries', '3',
     '--skip-download', '--dump-single-json',
@@ -646,9 +684,16 @@ function ytdlpJsonArgs(sourceUrl) {
   if (YTDLP_IMPERSONATE) args.push('--impersonate', YTDLP_IMPERSONATE);
   else if (platform === 'facebook' || platform === 'instagram') args.push('--impersonate', 'chrome');
 
-  // Optional escape hatch for future YouTube client changes without rebuilding the Gateway.
-  if (platform === 'youtube' && YOUTUBE_PLAYER_CLIENTS) {
-    args.push('--extractor-args', `youtube:player_client=${YOUTUBE_PLAYER_CLIENTS}`);
+  if (platform === 'youtube') {
+    // mweb + a GVS PO Token restores live/DASH formats that YouTube may hide
+    // from datacenter IPs. The configured list remains an escape hatch, but
+    // mweb is automatically prepended whenever the provider is installed.
+    if (EFFECTIVE_YOUTUBE_PLAYER_CLIENTS) {
+      args.push('--extractor-args', `youtube:player_client=${EFFECTIVE_YOUTUBE_PLAYER_CLIENTS}`);
+    }
+    if (YOUTUBE_PO_PROVIDER_AVAILABLE) {
+      args.push('--extractor-args', `youtubepot-bgutilscript:server_home=${YOUTUBE_PO_PROVIDER_HOME}`);
+    }
   }
 
   args.push(sourceUrl);
@@ -660,7 +705,12 @@ function runYtDlpJson(sourceUrl) {
     execFile(
       YTDLP,
       ytdlpJsonArgs(sourceUrl),
-      { timeout: 50_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      {
+        timeout: 50_000,
+        maxBuffer: 16 * 1024 * 1024,
+        windowsHide: true,
+        env: ytdlpProcessEnv(sourceUrl)
+      },
       (error, stdout, stderr) => {
         if (error) {
           const detail = String(stderr || error.message || 'yt-dlp failed').trim().slice(-2200);
@@ -697,7 +747,12 @@ function formatToInput(format, fallbackHeaders = {}) {
     url,
     headers: safeHttpHeaders({ ...fallbackHeaders, ...(format?.http_headers || {}) }),
     vcodec: String(format?.vcodec || ''),
-    acodec: String(format?.acodec || '')
+    acodec: String(format?.acodec || ''),
+    formatId: String(format?.format_id || ''),
+    width: positiveInt(format?.width),
+    height: positiveInt(format?.height),
+    fps: Number(format?.fps) || 0,
+    tbr: Number(format?.tbr) || 0
   };
 }
 
@@ -835,6 +890,101 @@ function nativeOutputSize(resolved) {
   };
 }
 
+function fitWithin1080p(width, height) {
+  const sourceWidth = positiveInt(width);
+  const sourceHeight = positiveInt(height);
+  if (!sourceWidth || !sourceHeight) return { width: 720, height: 1280, capped: false };
+
+  const longEdge = Math.max(sourceWidth, sourceHeight);
+  const shortEdge = Math.min(sourceWidth, sourceHeight);
+  const scale = Math.min(
+    1,
+    SMART_LINK_MAX_LONG_EDGE / longEdge,
+    SMART_LINK_MAX_SHORT_EDGE / shortEdge
+  );
+  const evenDown = value => Math.max(2, Math.floor(value / 2) * 2);
+  return {
+    width: evenDown(sourceWidth * scale),
+    height: evenDown(sourceHeight * scale),
+    capped: scale < 0.9999
+  };
+}
+
+function cappedOutputSize(resolved) {
+  const native = nativeOutputSize(resolved);
+  return fitWithin1080p(native.width, native.height);
+}
+
+function formatHasVideo(format) {
+  return Boolean(format && format.vcodec && format.vcodec !== 'none');
+}
+
+function formatHasAudio(format) {
+  return Boolean(format && format.acodec && format.acodec !== 'none');
+}
+
+function formatFits1080p(format) {
+  const width = positiveInt(format?.width);
+  const height = positiveInt(format?.height);
+  if (!width || !height) return false;
+  return Math.max(width, height) <= SMART_LINK_MAX_LONG_EDGE
+    && Math.min(width, height) <= SMART_LINK_MAX_SHORT_EDGE;
+}
+
+function formatArea(format) {
+  return positiveInt(format?.width) * positiveInt(format?.height);
+}
+
+function formatBitrate(format) {
+  return Number(format?.tbr) || (Number(format?.vbr) + Number(format?.abr)) || Number(format?.vbr) || 0;
+}
+
+function compareVideoFormats(a, b) {
+  // H.264 can be remuxed directly to HTTP-FLV. Prefer it before another codec
+  // that would force a costly Render transcode, then keep the clearest <=1080p rendition.
+  const h264 = Number(codecIsH264(b?.vcodec)) - Number(codecIsH264(a?.vcodec));
+  if (h264) return h264;
+  const area = formatArea(b) - formatArea(a);
+  if (area) return area;
+  // For equal resolution prefer normal 30 fps, reducing source bandwidth and jitter.
+  const aFpsPenalty = (Number(a?.fps) || 0) > 30.5 ? 1 : 0;
+  const bFpsPenalty = (Number(b?.fps) || 0) > 30.5 ? 1 : 0;
+  if (aFpsPenalty !== bFpsPenalty) return aFpsPenalty - bFpsPenalty;
+  return formatBitrate(b) - formatBitrate(a);
+}
+
+function compareAudioFormats(a, b) {
+  const aac = Number(codecIsAac(b?.acodec)) - Number(codecIsAac(a?.acodec));
+  if (aac) return aac;
+  const audioOnly = Number(!formatHasVideo(b)) - Number(!formatHasVideo(a));
+  if (audioOnly) return audioOnly;
+  // If Meta exposes no audio-only URL, use the smallest combined rendition as
+  // the audio input so a 4K video track is not downloaded merely to get audio.
+  if (formatHasVideo(a) && formatHasVideo(b)) {
+    const area = formatArea(a) - formatArea(b);
+    if (area) return area;
+  }
+  return (Number(b?.abr) || Number(b?.tbr) || 0) - (Number(a?.abr) || Number(a?.tbr) || 0);
+}
+
+function pick1080pFormats(info) {
+  const formats = Array.isArray(info?.formats) ? info.formats : [];
+  const videoCandidates = formats
+    .filter(format => formatHasVideo(format) && /^https?:\/\//i.test(String(format?.url || '')) && formatFits1080p(format))
+    .sort(compareVideoFormats);
+  const video = videoCandidates[0] || null;
+  if (!video) return null;
+
+  // A combined H.264/AAC rendition is ideal for Facebook and live HLS: one
+  // connection, matching timestamps, and no unnecessary audio download.
+  if (formatHasAudio(video) && codecIsAac(video.acodec)) return { video, audio: video };
+
+  const audioCandidates = formats
+    .filter(format => formatHasAudio(format) && /^https?:\/\//i.test(String(format?.url || '')))
+    .sort(compareAudioFormats);
+  return { video, audio: audioCandidates[0] || null };
+}
+
 function resolvedGeometry(info, videoFmt = null) {
   let width = positiveInt(videoFmt?.width) || positiveInt(info?.width);
   let height = positiveInt(videoFmt?.height) || positiveInt(info?.height);
@@ -855,6 +1005,19 @@ function resolvedGeometry(info, videoFmt = null) {
 function pickResolvedInputs(info) {
   const baseHeaders = safeHttpHeaders(info?.http_headers || {});
   const requested = Array.isArray(info?.requested_formats) ? info.requested_formats : [];
+
+  // Ignore a 2K/4K requested rendition when yt-dlp also exposes a <=1080p
+  // rendition. This reduces proxy/CDN traffic before FFmpeg, instead of first
+  // downloading 4K and only then scaling it down on Render.
+  const cappedFormats = pick1080pFormats(info);
+  if (cappedFormats) {
+    const video = formatToInput(cappedFormats.video, baseHeaders);
+    const audio = formatToInput(cappedFormats.audio, baseHeaders);
+    if (!video) throw new Error('yt-dlp không trả URL video 1080p có thể phát');
+    const geometry = resolvedGeometry(info, cappedFormats.video);
+    if (audio && audio.url !== video.url) return { inputs: [video, audio], videoIndex: 0, audioIndex: 1, ...geometry };
+    return { inputs: [video], videoIndex: 0, audioIndex: audio ? 0 : null, ...geometry };
+  }
 
   if (requested.length) {
     const videoFmt = requested.find(f => f && f.vcodec && f.vcodec !== 'none') || null;
@@ -907,20 +1070,20 @@ function ffmpegHeaderValue(headers) {
 
 function ffmpegInputArgs(input, proxyUrl = '', isLive = false) {
   const args = [];
-  // Live HLS/DASH is already paced by its origin. Applying -re again can make
-  // the reader lag behind the live edge; keep -re only for normal VOD files.
-  if (!isLive) args.push('-re');
+  // Do not use -re here. Android performs the final real-time pacing. Let the
+  // Gateway fill its playback buffer as quickly as the source allows so short
+  // CDN/proxy stalls do not immediately interrupt the outgoing Live.
   args.push(
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-reconnect_on_network_error', '1', '-reconnect_on_http_error', '408,429,5xx',
-    '-rw_timeout', isLive ? '30000000' : '15000000'
+    '-rw_timeout', '30000000'
   );
   // Keep the media download on the same exit IP used by yt-dlp. Without this,
   // signed Googlevideo URLs may send a short FLV header and then fail with 403.
   args.push(...ffmpegHttpProxyArgs(input?.url, proxyUrl));
   const headerValue = ffmpegHeaderValue(input.headers);
   if (headerValue) args.push('-headers', headerValue);
-  args.push('-thread_queue_size', '1024', '-i', input.url);
+  args.push('-thread_queue_size', '4096', '-i', input.url);
   return args;
 }
 
@@ -938,8 +1101,9 @@ function canNativeCopy(resolved, container, targetSize) {
   if (!targetSize || targetSize.width !== native.width || targetSize.height !== native.height) return false;
   if ((resolved.rotation || 0) !== 0 || Math.abs((ratioNumber(resolved.sar) || 1) - 1) > 0.0001) return false;
   const video = resolved.inputs?.[resolved.videoIndex ?? 0];
-  const audio = resolved.audioIndex == null ? null : resolved.inputs?.[resolved.audioIndex];
-  return codecIsH264(video?.vcodec) && (!audio || codecIsAac(audio?.acodec));
+  // Audio is deliberately normalized in ffmpegCopyTail. Only the video codec
+  // must be FLV-compatible for the low-CPU video-copy path.
+  return codecIsH264(video?.vcodec);
 }
 
 function ffmpegCopyTail(videoIndex = 0, audioIndex = 0) {
@@ -948,7 +1112,12 @@ function ffmpegCopyTail(videoIndex = 0, audioIndex = 0) {
   else args.push('-map', `${audioIndex}:a:0?`);
   args.push(
     '-fflags', '+genpts', '-avoid_negative_ts', 'make_zero',
-    '-c:v', 'copy', '-c:a', 'copy',
+    '-c:v', 'copy',
+    // Never copy the source AAC configuration verbatim. Some YouTube/Meta
+    // renditions expose an empty or unusual AudioSpecificConfig that causes
+    // Media3's FLV reader to fail before reaching READY. Rebuilding only audio
+    // is cheap and guarantees the exact format expected by the Android app.
+    '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '128k', '-ar', '44100', '-ac', '2',
     '-flvflags', 'no_duration_filesize', '-f', 'flv', 'pipe:1'
   );
   return args;
@@ -1146,12 +1315,25 @@ function smartLinkResolveError(sourceUrl, message) {
   const lower = String(message || '').toLowerCase();
   const authLike = /sign in|log in|login|cookies?|not a bot|confirm you(?:'|’)re not a bot|authentication|private video|members-only|age-restricted/.test(lower);
   const forbidden = /http error 403|forbidden|429|too many requests/.test(lower);
+  const poTokenLike = /po token|proof[- ]of[- ]origin|gvs|missing[^\n]*token|token[^\n]*required|no video formats|requested format is not available|only images/.test(lower);
+  const notStarted = /live event will begin|not yet started|scheduled for|upcoming|premiere will begin/.test(lower);
   const cookieFile = cookieFileForPlatform(platform);
+
+  if (platform === 'youtube' && notStarted) return {
+    code: 'YOUTUBE_LIVE_NOT_STARTED', needsCookies: false, needsProxy: false,
+    hint: 'Livestream này mới được lên lịch và chưa bắt đầu phát. Hãy thử lại khi YouTube đã hiện LIVE.'
+  };
+  if (platform === 'youtube' && poTokenLike) return {
+    code: 'YOUTUBE_PO_TOKEN_FAILED', needsCookies: false, needsProxy: false,
+    hint: YOUTUBE_PO_PROVIDER_AVAILABLE
+      ? 'Gateway có PO Token provider nhưng YouTube chưa cấp manifest livestream. Thử lại sau 5-10 giây; nếu vẫn lỗi, kiểm tra proxy YouTube còn hoạt động.'
+      : 'Gateway hiện chưa có PO Token provider cho YouTube Live. Hãy deploy Gateway 2.8.4 trở lên.'
+  };
 
   if (platform === 'youtube' && authLike) {
     if (!cookieFile) return {
       code: 'YOUTUBE_AUTH_REQUIRED', needsCookies: true, needsProxy: false,
-      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.8.1 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.8.4 đã có JS/EJS và PO Token; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
     };
     return {
       code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
@@ -1190,6 +1372,7 @@ async function handleProbe(req, res, requestUrl) {
   try {
     const resolved = await resolvePageMedia(sourceUrl);
     const native = nativeOutputSize(resolved);
+    const output = cappedOutputSize(resolved);
     return json(res, 200, {
       ok: true,
       version: GATEWAY_VERSION,
@@ -1197,18 +1380,20 @@ async function handleProbe(req, res, requestUrl) {
       rawHeight: resolved.rawHeight || resolved.sourceHeight,
       sourceWidth: resolved.displayWidth || resolved.sourceWidth,
       sourceHeight: resolved.displayHeight || resolved.sourceHeight,
-      displayWidth: native.width,
-      displayHeight: native.height,
+      displayWidth: output.width,
+      displayHeight: output.height,
       sar: resolved.sar || '1:1',
       dar: resolved.dar || `${native.width}:${native.height}`,
       rotation: resolved.rotation || 0,
       geometrySource: resolved.geometrySource || 'unknown',
-      encoderWidth: native.width,
-      encoderHeight: native.height,
-      nativeResolution: true,
+      encoderWidth: output.width,
+      encoderHeight: output.height,
+      nativeResolution: !output.capped,
+      resolutionCapped: output.capped,
+      maxResolution: '1080p',
       isLive: Boolean(resolved.isLive),
       liveStatus: resolved.liveStatus || 'not_live',
-      aspect: native.width / native.height
+      aspect: output.width / output.height
     });
   } catch (e) {
     const message = String(e?.message || 'Không tách được link').slice(-1600);
@@ -1245,17 +1430,24 @@ async function handleSource(req, res, requestUrl) {
       const requestedW = positiveInt(requestUrl.searchParams.get('w'));
       const requestedH = positiveInt(requestUrl.searchParams.get('h'));
       const native = nativeOutputSize(resolved);
-      outputSize = (requestedW >= 2 && requestedH >= 2 && requestedW <= 8192 && requestedH <= 8192)
-        ? { width: evenNative(requestedW), height: evenNative(requestedH) }
-        : native;
+      const cappedNative = cappedOutputSize(resolved);
+      const requested = (requestedW >= 2 && requestedH >= 2 && requestedW <= 8192 && requestedH <= 8192)
+        ? fitWithin1080p(requestedW, requestedH)
+        : null;
+      const nativeAspect = native.width / native.height;
+      const requestedAspect = requested ? requested.width / requested.height : 0;
+      const requestedKeepsAspect = requested && Math.abs((requestedAspect / nativeAspect) - 1) <= 0.015;
+      outputSize = requestedKeepsAspect
+        ? { width: requested.width, height: requested.height }
+        : { width: cappedNative.width, height: cappedNative.height };
       // Do not silently accept a caller canvas that differs from the probed native frame.
       // Old clients may still send w/h, but v5 clients send exactly these native values.
-      if (requestedW > 0 && requestedH > 0 && (outputSize.width !== native.width || outputSize.height !== native.height)) {
-        console.warn(`[smart-link native] requested ${outputSize.width}x${outputSize.height}, native ${native.width}x${native.height}`);
+      if (requestedW > 0 && requestedH > 0 && (!requestedKeepsAspect || outputSize.width !== requestedW || outputSize.height !== requestedH)) {
+        console.warn(`[smart-link 1080p] requested ${requestedW}x${requestedH}, output ${outputSize.width}x${outputSize.height}, source ${native.width}x${native.height}`);
       }
       const ffBuild = ffmpegForResolved(resolved, container, outputSize);
       ffArgs = ffBuild.args;
-      if (ffBuild.nativeCopy) console.log(`[smart-link native-copy] ${outputSize.width}x${outputSize.height} H.264/AAC remux`);
+      if (ffBuild.nativeCopy) console.log(`[smart-link video-copy] ${outputSize.width}x${outputSize.height} H.264 copy + normalized AAC-LC`);
     } catch (e) {
       const message = String(e?.message || 'Không tách được link').slice(-1600);
       console.error('[smart-link resolve]', message);
@@ -1318,7 +1510,7 @@ async function handleSource(req, res, requestUrl) {
     'x-shoplive-source': pageSource ? 'smart-link-resolved' : 'direct',
     'x-shoplive-container': container,
     'x-shoplive-gateway-version': GATEWAY_VERSION,
-    'x-shoplive-frame-policy': 'native-no-pad-no-crop',
+    'x-shoplive-frame-policy': '1080p-max-no-pad-no-crop',
     'x-shoplive-live': sourceIsLive ? 'true' : 'false',
     ...(outputSize ? { 'x-shoplive-width': String(outputSize.width), 'x-shoplive-height': String(outputSize.height) } : {})
   });
@@ -1356,7 +1548,7 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/healthz') {
       const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffprobe, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY) });
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffprobe, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY), youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE, youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default' });
     }
     if (requestUrl.pathname === '/health') {
       if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
@@ -1373,6 +1565,8 @@ const server = http.createServer(async (req, res) => {
         proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY),
         youtubeProxyConfigured: Boolean(YTDLP_PROXY),
         metaProxyConfigured: Boolean(META_PROXY),
+        youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE,
+        youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default',
         node: process.version,
         jsRuntime: 'node',
         resolution: RESOLUTION.replace(':', 'x')
