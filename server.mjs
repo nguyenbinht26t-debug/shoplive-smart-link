@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.8.5';
+const GATEWAY_VERSION = '2.8.6';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -45,6 +45,15 @@ const YTDLP_IMPERSONATE = (process.env.YTDLP_IMPERSONATE || '').trim();
 const YOUTUBE_PLAYER_CLIENTS = (process.env.YOUTUBE_PLAYER_CLIENTS || '').trim();
 const YOUTUBE_PO_PROVIDER_HOME = (process.env.YOUTUBE_PO_PROVIDER_HOME || '/opt/bgutil-ytdlp-pot-provider/server').trim();
 const YOUTUBE_PO_PROVIDER_AVAILABLE = Boolean(YOUTUBE_PO_PROVIDER_HOME && fs.existsSync(YOUTUBE_PO_PROVIDER_HOME));
+const configuredPoPort = Number(process.env.YOUTUBE_PO_PROVIDER_PORT || 4416);
+const YOUTUBE_PO_PROVIDER_PORT = Number.isInteger(configuredPoPort) && configuredPoPort > 0 && configuredPoPort <= 65535
+  ? configuredPoPort
+  : 4416;
+const YOUTUBE_PO_PROVIDER_ENTRY = path.join(YOUTUBE_PO_PROVIDER_HOME, 'build', 'main.js');
+let youtubePoHttpProcess = null;
+let youtubePoHttpRunning = false;
+let youtubePoRestartTimer = null;
+let shuttingDown = false;
 
 function effectiveYoutubePlayerClients() {
   const clients = YOUTUBE_PLAYER_CLIENTS
@@ -404,6 +413,76 @@ function commandExists(command) {
   });
 }
 
+function sanitizeSensitiveText(value) {
+  return String(value || '')
+    .replace(/((?:https?|socks(?:4|5)h?):\/\/)([^@\s/]+)@/gi, '$1***:***@')
+    .replace(/(--proxy(?:=|\s+))\S+/gi, '$1[REDACTED]')
+    .replace(/(--cookies(?:=|\s+))\S+/gi, '$1[COOKIE_FILE]');
+}
+
+function withOutboundProxyEnv(baseEnv, proxyUrl) {
+  if (!proxyUrl) return baseEnv;
+  return {
+    ...baseEnv,
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    ALL_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    all_proxy: proxyUrl,
+    NO_PROXY: '127.0.0.1,localhost,::1',
+    no_proxy: '127.0.0.1,localhost,::1'
+  };
+}
+
+function scheduleYoutubePoProviderRestart() {
+  if (shuttingDown || youtubePoRestartTimer || !YOUTUBE_PO_PROVIDER_AVAILABLE) return;
+  youtubePoRestartTimer = setTimeout(() => {
+    youtubePoRestartTimer = null;
+    startYoutubePoProvider();
+  }, 3000);
+  youtubePoRestartTimer.unref();
+}
+
+function startYoutubePoProvider() {
+  if (!YOUTUBE_PO_PROVIDER_AVAILABLE || !fs.existsSync(YOUTUBE_PO_PROVIDER_ENTRY)) {
+    console.warn('[youtube po] HTTP provider build is unavailable; script fallback remains enabled');
+    return;
+  }
+  if (youtubePoHttpProcess) return;
+
+  const providerEnv = withOutboundProxyEnv({ ...process.env }, YTDLP_PROXY);
+  const child = spawn(
+    process.execPath,
+    [YOUTUBE_PO_PROVIDER_ENTRY, '--port', String(YOUTUBE_PO_PROVIDER_PORT)],
+    { env: providerEnv, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true }
+  );
+  youtubePoHttpProcess = child;
+
+  child.on('spawn', () => {
+    youtubePoHttpRunning = true;
+    console.log(`[youtube po] HTTP provider started on localhost:${YOUTUBE_PO_PROVIDER_PORT}`);
+  });
+  child.stderr.on('data', chunk => {
+    const safe = sanitizeSensitiveText(chunk).trim();
+    if (safe) console.warn('[youtube po]', safe.slice(-1000));
+  });
+  child.on('error', error => {
+    if (youtubePoHttpProcess === child) youtubePoHttpProcess = null;
+    youtubePoHttpRunning = false;
+    console.error('[youtube po] start failed:', sanitizeSensitiveText(error?.message).slice(0, 500));
+    scheduleYoutubePoProviderRestart();
+  });
+  child.on('exit', (code, signal) => {
+    youtubePoHttpProcess = null;
+    youtubePoHttpRunning = false;
+    if (!shuttingDown) {
+      console.warn(`[youtube po] stopped (${code ?? signal ?? 'unknown'}), restarting`);
+      scheduleYoutubePoProviderRestart();
+    }
+  });
+}
+
 function readJsonBody(req, maxBytes = 32 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -648,15 +727,7 @@ function ytdlpProcessEnv(sourceUrl) {
   // Provider 1.3.1 forwards environment variables to its JavaScript runtime.
   // Give the PO generator the same outbound proxy as yt-dlp so the token,
   // manifest and signed Googlevideo URL all originate from one exit IP.
-  return {
-    ...process.env,
-    HTTP_PROXY: platformProxy,
-    HTTPS_PROXY: platformProxy,
-    ALL_PROXY: platformProxy,
-    http_proxy: platformProxy,
-    https_proxy: platformProxy,
-    all_proxy: platformProxy
-  };
+  return withOutboundProxyEnv({ ...process.env }, platformProxy);
 }
 
 function liveStatusFromInfo(info) {
@@ -696,6 +767,7 @@ function ytdlpJsonArgs(sourceUrl) {
       args.push('--extractor-args', `youtube:player_client=${EFFECTIVE_YOUTUBE_PLAYER_CLIENTS}`);
     }
     if (YOUTUBE_PO_PROVIDER_AVAILABLE) {
+      args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=http://127.0.0.1:${YOUTUBE_PO_PROVIDER_PORT}`);
       args.push('--extractor-args', `youtubepot-bgutilscript:server_home=${YOUTUBE_PO_PROVIDER_HOME}`);
     }
   }
@@ -717,7 +789,16 @@ function runYtDlpJson(sourceUrl) {
       },
       (error, stdout, stderr) => {
         if (error) {
-          const detail = String(stderr || error.message || 'yt-dlp failed').trim().slice(-2200);
+          const timedOut = error?.killed === true || error?.signal === 'SIGTERM' || error?.code === 'ETIMEDOUT';
+          if (timedOut) {
+            return reject(new Error('YTDLP_TIMEOUT: yt-dlp không hoàn tất việc lấy livestream trong 50 giây'));
+          }
+          // Never return error.message here: Node includes the full command and
+          // would expose proxy credentials/cookie paths to the Android UI.
+          const safeStderr = sanitizeSensitiveText(stderr).trim();
+          const detail = safeStderr
+            ? safeStderr.slice(-2200)
+            : `yt-dlp failed (exit=${String(error?.code ?? 'unknown').slice(0, 60)})`;
           return reject(new Error(detail || 'yt-dlp failed'));
         }
         try {
@@ -1319,10 +1400,15 @@ function smartLinkResolveError(sourceUrl, message) {
   const lower = String(message || '').toLowerCase();
   const authLike = /sign in|log in|login|cookies?|not a bot|confirm you(?:'|’)re not a bot|authentication|private video|members-only|age-restricted/.test(lower);
   const forbidden = /http error 403|forbidden|429|too many requests/.test(lower);
+  const timedOut = /ytdlp_timeout|timed out|không hoàn tất[^\n]*50 giây/.test(lower);
   const poTokenLike = /po token|proof[- ]of[- ]origin|gvs|missing[^\n]*token|token[^\n]*required|no video formats|requested format is not available|only images/.test(lower);
   const notStarted = /live event will begin|not yet started|scheduled for|upcoming|premiere will begin/.test(lower);
   const cookieFile = cookieFileForPlatform(platform);
 
+  if (platform === 'youtube' && timedOut) return {
+    code: 'YOUTUBE_EXTRACTOR_TIMEOUT', needsCookies: false, needsProxy: false,
+    hint: 'YouTube Live phản hồi quá chậm. Gateway đã chuyển sang PO HTTP provider; thử lại sau 5-10 giây. Nếu lặp lại, kiểm tra proxy còn tốc độ và còn hạn.'
+  };
   if (platform === 'youtube' && notStarted) return {
     code: 'YOUTUBE_LIVE_NOT_STARTED', needsCookies: false, needsProxy: false,
     hint: 'Livestream này mới được lên lịch và chưa bắt đầu phát. Hãy thử lại khi YouTube đã hiện LIVE.'
@@ -1552,7 +1638,7 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/healthz') {
       const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffmpeg, ffprobe, ytdlp, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY), youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE, youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default' });
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffmpeg, ffprobe, ytdlp, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY), youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE, youtubePoHttpProvider: youtubePoHttpRunning, youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default' });
     }
     if (requestUrl.pathname === '/health') {
       if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
@@ -1570,6 +1656,7 @@ const server = http.createServer(async (req, res) => {
         youtubeProxyConfigured: Boolean(YTDLP_PROXY),
         metaProxyConfigured: Boolean(META_PROXY),
         youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE,
+        youtubePoHttpProvider: youtubePoHttpRunning,
         youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default',
         node: process.version,
         jsRuntime: 'node',
@@ -1584,6 +1671,14 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) json(res, 500, { ok: false, error: String(e?.message || 'internal error').slice(0, 500) });
     else res.destroy(e);
   }
+});
+
+startYoutubePoProvider();
+
+process.once('exit', () => {
+  shuttingDown = true;
+  if (youtubePoRestartTimer) clearTimeout(youtubePoRestartTimer);
+  if (youtubePoHttpProcess && !youtubePoHttpProcess.killed) youtubePoHttpProcess.kill('SIGTERM');
 });
 
 server.listen(PORT, HOST, () => {
