@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.8.0';
+const GATEWAY_VERSION = '2.8.1';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -36,6 +36,7 @@ const YTDLP_COOKIES_B64 = (process.env.YTDLP_COOKIES_B64 || '').trim();
 const YOUTUBE_COOKIES_B64 = (process.env.YOUTUBE_COOKIES_B64 || '').trim();
 const FACEBOOK_COOKIES_B64 = (process.env.FACEBOOK_COOKIES_B64 || '').trim();
 const YTDLP_PROXY = (process.env.YTDLP_PROXY || '').trim();
+const META_PROXY = (process.env.META_PROXY || '').trim();
 const YTDLP_IMPERSONATE = (process.env.YTDLP_IMPERSONATE || '').trim();
 const YOUTUBE_PLAYER_CLIENTS = (process.env.YOUTUBE_PLAYER_CLIENTS || '').trim();
 
@@ -608,6 +609,20 @@ function cookieFileForPlatform(platform) {
   return YTDLP_COOKIES_FILE;
 }
 
+function proxyForPlatform(platform) {
+  // YTDLP_PROXY is intentionally YouTube-only. An expired YouTube proxy must
+  // never prevent Facebook/Instagram/TikTok links from being resolved directly.
+  if (platform === 'youtube') return YTDLP_PROXY;
+  if (platform === 'facebook' || platform === 'instagram') return META_PROXY;
+  return '';
+}
+
+function liveStatusFromInfo(info) {
+  const status = String(info?.live_status || '').trim().toLowerCase();
+  const isLive = info?.is_live === true || status === 'is_live' || status === 'live';
+  return { isLive, liveStatus: status || (isLive ? 'is_live' : 'not_live') };
+}
+
 function ytdlpJsonArgs(sourceUrl) {
   // yt-dlp 2026 YouTube extraction needs an external JS runtime/EJS challenge solver.
   // The Gateway image uses Node 22 and yt-dlp[default,curl-cffi]; explicitly enable Node
@@ -623,7 +638,8 @@ function ytdlpJsonArgs(sourceUrl) {
 
   const cookieFile = cookieFileForPlatform(platform);
   if (cookieFile) args.push('--cookies', cookieFile);
-  if (YTDLP_PROXY) args.push('--proxy', YTDLP_PROXY);
+  const platformProxy = proxyForPlatform(platform);
+  if (platformProxy) args.push('--proxy', platformProxy);
 
   // curl_cffi is installed so extractors that need browser impersonation (notably Meta sites)
   // can use it. Do not force impersonation globally because some sites work worse when forced.
@@ -712,14 +728,14 @@ function evenNative(value) {
   return n % 2 === 0 ? n : n + 1;
 }
 
-function ffmpegHttpProxyArgs(url, proxyUrl = YTDLP_PROXY) {
+function ffmpegHttpProxyArgs(url, proxyUrl = '') {
   const normalizedProxy = String(proxyUrl || '').trim();
   const normalizedUrl = String(url || '').trim();
   if (!normalizedProxy || !/^https?:\/\//i.test(normalizedUrl)) return [];
   return ['-http_proxy', normalizedProxy];
 }
 
-function runFfprobeGeometry(input) {
+function runFfprobeGeometry(input, proxyUrl = '') {
   return new Promise((resolve, reject) => {
     const args = [
       '-v', 'error',
@@ -729,7 +745,7 @@ function runFfprobeGeometry(input) {
     ];
     // yt-dlp may return a CDN URL bound to the proxy exit IP. FFprobe must use
     // the same proxy or geometry probing can intermittently fall back after 403.
-    args.push(...ffmpegHttpProxyArgs(input?.url));
+    args.push(...ffmpegHttpProxyArgs(input?.url, proxyUrl));
     const headerValue = ffmpegHeaderValue(input?.headers || {});
     if (headerValue) args.push('-headers', headerValue);
     args.push(input.url);
@@ -793,7 +809,7 @@ async function enrichResolvedGeometry(resolved) {
     geometrySource: 'yt-dlp-fallback'
   };
   try {
-    const geometry = await runFfprobeGeometry(videoInput);
+    const geometry = await runFfprobeGeometry(videoInput, resolved.proxyUrl);
     return { ...resolved, ...geometry, sourceWidth: geometry.displayWidth, sourceHeight: geometry.displayHeight, geometrySource: 'ffprobe' };
   } catch (e) {
     console.warn('[smart-link ffprobe fallback]', e.message);
@@ -863,8 +879,15 @@ async function resolvePageMedia(sourceUrl) {
   const cached = sourceResolveCache.get(sourceUrl);
   if (cached && cached.expiresAt > now) return cached.promise;
 
+  const platform = extractorPlatform(sourceUrl);
+  const proxyUrl = proxyForPlatform(platform);
   const promise = runYtDlpJson(sourceUrl)
-    .then(info => pickResolvedInputs(info))
+    .then(info => ({
+      ...pickResolvedInputs(info),
+      platform,
+      proxyUrl,
+      ...liveStatusFromInfo(info)
+    }))
     .then(resolved => enrichResolvedGeometry(resolved))
     .catch(error => {
       sourceResolveCache.delete(sourceUrl);
@@ -882,13 +905,16 @@ function ffmpegHeaderValue(headers) {
   return entries.map(([key, value]) => `${key}: ${value}\r\n`).join('');
 }
 
-function ffmpegInputArgs(input, proxyUrl = '') {
-  const args = [
-    '-re',
+function ffmpegInputArgs(input, proxyUrl = '', isLive = false) {
+  const args = [];
+  // Live HLS/DASH is already paced by its origin. Applying -re again can make
+  // the reader lag behind the live edge; keep -re only for normal VOD files.
+  if (!isLive) args.push('-re');
+  args.push(
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-reconnect_on_network_error', '1', '-reconnect_on_http_error', '408,429,5xx',
-    '-rw_timeout', '15000000'
-  ];
+    '-rw_timeout', isLive ? '30000000' : '15000000'
+  );
   // Keep the media download on the same exit IP used by yt-dlp. Without this,
   // signed Googlevideo URLs may send a short FLV header and then fail with 403.
   args.push(...ffmpegHttpProxyArgs(input?.url, proxyUrl));
@@ -976,7 +1002,7 @@ function ffmpegForDirect(sourceUrl, container = 'ts') {
 
 function ffmpegForResolved(resolved, container = 'ts', targetSize = null) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-nostdin'];
-  for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input, YTDLP_PROXY));
+  for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input, resolved.proxyUrl, resolved.isLive));
   const nativeCopy = canNativeCopy(resolved, container, targetSize);
   args.push(...(nativeCopy
     ? ffmpegCopyTail(resolved.videoIndex, resolved.audioIndex)
@@ -1125,7 +1151,7 @@ function smartLinkResolveError(sourceUrl, message) {
   if (platform === 'youtube' && authLike) {
     if (!cookieFile) return {
       code: 'YOUTUBE_AUTH_REQUIRED', needsCookies: true, needsProxy: false,
-      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.7.9 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.8.1 đã có JS/EJS đầy đủ; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
     };
     return {
       code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
@@ -1180,6 +1206,8 @@ async function handleProbe(req, res, requestUrl) {
       encoderWidth: native.width,
       encoderHeight: native.height,
       nativeResolution: true,
+      isLive: Boolean(resolved.isLive),
+      liveStatus: resolved.liveStatus || 'not_live',
       aspect: native.width / native.height
     });
   } catch (e) {
@@ -1209,9 +1237,11 @@ async function handleSource(req, res, requestUrl) {
   const pageSource = supportedShareHost(parsed.hostname);
   let ffArgs;
   let outputSize = null;
+  let sourceIsLive = false;
   if (pageSource) {
     try {
       const resolved = await resolvePageMedia(sourceUrl);
+      sourceIsLive = Boolean(resolved.isLive);
       const requestedW = positiveInt(requestUrl.searchParams.get('w'));
       const requestedH = positiveInt(requestUrl.searchParams.get('h'));
       const native = nativeOutputSize(resolved);
@@ -1263,7 +1293,7 @@ async function handleSource(req, res, requestUrl) {
   // ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED instead of the real yt-dlp/FFmpeg error.
   let probe;
   try {
-    probe = await probeFfmpegOutput(ff, container);
+    probe = await probeFfmpegOutput(ff, container, sourceIsLive ? 45000 : 25000);
   } catch (e) {
     const message = String(e?.message || 'FFmpeg không tạo được media').slice(-2200);
     console.error('[smart-link ffmpeg probe]', message);
@@ -1289,6 +1319,7 @@ async function handleSource(req, res, requestUrl) {
     'x-shoplive-container': container,
     'x-shoplive-gateway-version': GATEWAY_VERSION,
     'x-shoplive-frame-policy': 'native-no-pad-no-crop',
+    'x-shoplive-live': sourceIsLive ? 'true' : 'false',
     ...(outputSize ? { 'x-shoplive-width': String(outputSize.width), 'x-shoplive-height': String(outputSize.height) } : {})
   });
   res.write(probe.prefix);
@@ -1304,7 +1335,7 @@ async function handleSource(req, res, requestUrl) {
   });
   ff.on('close', code => {
     if (!closed && code !== 0) console.error(`ffmpeg exited ${code}`);
-    if (pageSource && code !== 0) sourceResolveCache.delete(sourceUrl);
+    if (pageSource && (code !== 0 || sourceIsLive)) sourceResolveCache.delete(sourceUrl);
     if (!res.writableEnded) res.end();
     closed = true;
   });
@@ -1325,7 +1356,7 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/healthz') {
       const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
-      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffprobe, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY) });
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffprobe, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY) });
     }
     if (requestUrl.pathname === '/health') {
       if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
@@ -1339,7 +1370,9 @@ const server = http.createServer(async (req, res) => {
         cookiesConfigured: Boolean(YTDLP_COOKIES_FILE || YOUTUBE_COOKIES_FILE || FACEBOOK_COOKIES_FILE),
         youtubeCookiesConfigured: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE),
         facebookCookiesConfigured: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE),
-        proxyConfigured: Boolean(YTDLP_PROXY),
+        proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY),
+        youtubeProxyConfigured: Boolean(YTDLP_PROXY),
+        metaProxyConfigured: Boolean(META_PROXY),
         node: process.version,
         jsRuntime: 'node',
         resolution: RESOLUTION.replace(':', 'x')
