@@ -1,4 +1,4 @@
-# ShopLive AI Smart Link Gateway 2.8.5
+# ShopLive AI Smart Link Gateway 2.8.7
 
 Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn khi cần, sau đó FFmpeg chuẩn hóa thành H.264/AAC HTTP-FLV cho Android.
 
@@ -8,7 +8,25 @@ Gateway nhận URL video công khai/không DRM, dùng yt-dlp để tách nguồn
 - `GET /health?key=<KEY>` — health chi tiết.
 - `GET /api/source-v3?key=<KEY>&container=flv&url=<URL_ENCODED>` — Smart Link hiện tại.
 
-## Điểm mới 2.8.5
+## Điểm mới 2.8.7
+
+- Ưu tiên `web_safari,mweb` cho YouTube: livestream có thêm đường HLS `web_safari`, còn video thường hoặc cần tài khoản vẫn giữ `mweb` cùng PO Token provider.
+- Giãn nhẹ các request metadata YouTube để giảm khả năng chạm giới hạn phiên/tài khoản.
+- Khi proxy trả HTTP 429, Gateway thử đúng một lần qua IP trực tiếp của Render bằng `web_safari`, không cookie và không PO provider. Nếu thành công, FFmpeg cũng đọc luồng theo đúng đường trực tiếp để tránh lệch IP.
+- Nhận diện HTTP 429 trước lỗi phụ `No video formats found`; ứng dụng không còn báo nhầm thành lỗi PO Token.
+- Nếu cả proxy và đường trực tiếp đều thất bại, trả hướng dẫn đổi IP proxy rõ ràng. Không lặp vô hạn làm IP bị giới hạn nặng hơn.
+
+## Điểm mới 2.8.6
+
+- Chạy PO Token provider ở chế độ HTTP thường trực trong cùng container, thay vì phải khởi động một tiến trình tạo token mới cho mỗi lần bắt link.
+- Giữ script provider làm dự phòng nếu HTTP provider chưa sẵn sàng ngay sau khi Render vừa khởi động.
+- PO HTTP provider dùng cùng `YTDLP_PROXY`; kết nối nội bộ localhost được loại khỏi proxy.
+- Không bao giờ trả nguyên `error.message` của Node về ứng dụng, tránh làm lộ tài khoản/mật khẩu proxy trong chi tiết lỗi.
+- Che URL có thông tin đăng nhập, `--proxy` và đường dẫn cookie trong log lỗi.
+- Nhận diện riêng timeout 50 giây bằng mã `YOUTUBE_EXTRACTOR_TIMEOUT`, không còn báo nhầm thành cookie/IP bị chặn.
+- `/healthz` trả thêm `youtubePoHttpProvider`; sau vài giây khởi động phải là `true`.
+
+## Nền tảng 2.8.5
 
 - Sửa health check FFmpeg/FFprobe dùng đúng tham số `-version`; bản 2.8.4 trước đó báo `ok: false` và `ffprobe: false` giả dù chương trình đã được cài.
 - `/healthz` hiển thị riêng cả `ffmpeg`, `ffprobe` và `ytdlp` để dễ xác định thành phần nào thực sự thiếu.

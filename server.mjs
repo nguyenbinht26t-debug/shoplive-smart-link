@@ -22,7 +22,7 @@ function loadEnv(file = path.resolve('.env')) {
 }
 loadEnv();
 
-const GATEWAY_VERSION = '2.8.6';
+const GATEWAY_VERSION = '2.8.7';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -60,9 +60,13 @@ function effectiveYoutubePlayerClients() {
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
-  // yt-dlp recommends mweb when a PO Token is available. Prepend it even if
-  // an older Render variable still contains web_safari/web_embedded.
-  if (YOUTUBE_PO_PROVIDER_AVAILABLE && !clients.includes('mweb')) clients.unshift('mweb');
+  if (YOUTUBE_PO_PROVIDER_AVAILABLE) {
+    // For an active livestream, web_safari exposes HLS without requiring a GVS
+    // PO token. Keep mweb immediately behind it so normal/account-restricted
+    // videos can still use the installed PO provider. This order is important:
+    // a rate-limited mweb manifest must not prevent the HLS client from trying.
+    return [...new Set(['web_safari', 'mweb', ...clients])].join(',');
+  }
   return [...new Set(clients)].join(',');
 }
 
@@ -719,9 +723,9 @@ function proxyForPlatform(platform) {
   return '';
 }
 
-function ytdlpProcessEnv(sourceUrl) {
+function ytdlpProcessEnv(sourceUrl, proxyOverride) {
   const platform = extractorPlatform(sourceUrl);
-  const platformProxy = proxyForPlatform(platform);
+  const platformProxy = proxyOverride === undefined ? proxyForPlatform(platform) : proxyOverride;
   if (platform !== 'youtube' || !platformProxy) return process.env;
 
   // Provider 1.3.1 forwards environment variables to its JavaScript runtime.
@@ -736,11 +740,17 @@ function liveStatusFromInfo(info) {
   return { isLive, liveStatus: status || (isLive ? 'is_live' : 'not_live') };
 }
 
-function ytdlpJsonArgs(sourceUrl) {
+function ytdlpJsonArgs(sourceUrl, options = {}) {
   // yt-dlp 2026 YouTube extraction needs an external JS runtime/EJS challenge solver.
   // The Gateway image uses Node 22 and yt-dlp[default,curl-cffi]; explicitly enable Node
   // so extraction is not silently degraded when YouTube changes its JS challenges.
   const platform = extractorPlatform(sourceUrl);
+  const useCookies = options.useCookies !== false;
+  const usePoProvider = options.usePoProvider !== false;
+  const platformProxy = options.proxyUrl === undefined ? proxyForPlatform(platform) : options.proxyUrl;
+  const youtubePlayerClients = options.youtubePlayerClients === undefined
+    ? EFFECTIVE_YOUTUBE_PLAYER_CLIENTS
+    : String(options.youtubePlayerClients || '').trim();
   const args = [
     '--no-playlist', '--no-progress',
     '--js-runtimes', 'node',
@@ -749,9 +759,8 @@ function ytdlpJsonArgs(sourceUrl) {
     '-f', 'bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc1]+ba/best[vcodec^=avc1]/bv*+ba/best'
   ];
 
-  const cookieFile = cookieFileForPlatform(platform);
+  const cookieFile = useCookies ? cookieFileForPlatform(platform) : '';
   if (cookieFile) args.push('--cookies', cookieFile);
-  const platformProxy = proxyForPlatform(platform);
   if (platformProxy) args.push('--proxy', platformProxy);
 
   // curl_cffi is installed so extractors that need browser impersonation (notably Meta sites)
@@ -760,13 +769,16 @@ function ytdlpJsonArgs(sourceUrl) {
   else if (platform === 'facebook' || platform === 'instagram') args.push('--impersonate', 'chrome');
 
   if (platform === 'youtube') {
+    // Slow consecutive YouTube metadata requests slightly. yt-dlp documents
+    // request pacing as the primary protection against guest/account rate limits.
+    args.push('--sleep-requests', '0.8');
     // mweb + a GVS PO Token restores live/DASH formats that YouTube may hide
     // from datacenter IPs. The configured list remains an escape hatch, but
     // mweb is automatically prepended whenever the provider is installed.
-    if (EFFECTIVE_YOUTUBE_PLAYER_CLIENTS) {
-      args.push('--extractor-args', `youtube:player_client=${EFFECTIVE_YOUTUBE_PLAYER_CLIENTS}`);
+    if (youtubePlayerClients) {
+      args.push('--extractor-args', `youtube:player_client=${youtubePlayerClients}`);
     }
-    if (YOUTUBE_PO_PROVIDER_AVAILABLE) {
+    if (YOUTUBE_PO_PROVIDER_AVAILABLE && usePoProvider) {
       args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=http://127.0.0.1:${YOUTUBE_PO_PROVIDER_PORT}`);
       args.push('--extractor-args', `youtubepot-bgutilscript:server_home=${YOUTUBE_PO_PROVIDER_HOME}`);
     }
@@ -776,22 +788,25 @@ function ytdlpJsonArgs(sourceUrl) {
   return args;
 }
 
-function runYtDlpJson(sourceUrl) {
+function runYtDlpJson(sourceUrl, options = {}) {
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs))
+    ? Math.max(5000, Math.min(50_000, Number(options.timeoutMs)))
+    : 50_000;
   return new Promise((resolve, reject) => {
     execFile(
       YTDLP,
-      ytdlpJsonArgs(sourceUrl),
+      ytdlpJsonArgs(sourceUrl, options),
       {
-        timeout: 50_000,
+        timeout: timeoutMs,
         maxBuffer: 16 * 1024 * 1024,
         windowsHide: true,
-        env: ytdlpProcessEnv(sourceUrl)
+        env: ytdlpProcessEnv(sourceUrl, options.proxyUrl)
       },
       (error, stdout, stderr) => {
         if (error) {
           const timedOut = error?.killed === true || error?.signal === 'SIGTERM' || error?.code === 'ETIMEDOUT';
           if (timedOut) {
-            return reject(new Error('YTDLP_TIMEOUT: yt-dlp không hoàn tất việc lấy livestream trong 50 giây'));
+            return reject(new Error(`YTDLP_TIMEOUT: yt-dlp không hoàn tất việc lấy livestream trong ${Math.round(timeoutMs / 1000)} giây`));
           }
           // Never return error.message here: Node includes the full command and
           // would expose proxy credentials/cookie paths to the Android UI.
@@ -809,6 +824,46 @@ function runYtDlpJson(sourceUrl) {
       }
     );
   });
+}
+
+function youtubeRateLimited(message) {
+  return /(?:http error\s*429|\b429\b[^\n]*too many requests|too many requests)/i.test(String(message || ''));
+}
+
+function waitMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function runMediaExtractor(sourceUrl) {
+  const platform = extractorPlatform(sourceUrl);
+  const configuredProxy = proxyForPlatform(platform);
+  try {
+    const info = await runYtDlpJson(sourceUrl, { proxyUrl: configuredProxy });
+    return { info, proxyUrl: configuredProxy, extractionRoute: configuredProxy ? 'configured-proxy' : 'direct' };
+  } catch (primaryError) {
+    // A PO token does not cure HTTP 429. For a public/unlisted live stream,
+    // make one controlled fallback through Render's direct IP using the HLS
+    // client, without account cookies or the PO provider. The returned media
+    // URL must then also be consumed directly, hence proxyUrl: ''.
+    if (platform !== 'youtube' || !configuredProxy || !youtubeRateLimited(primaryError?.message)) throw primaryError;
+
+    console.warn('[youtube 429] configured proxy was rate-limited; trying one direct web_safari HLS fallback');
+    await waitMs(1500);
+    try {
+      const info = await runYtDlpJson(sourceUrl, {
+        proxyUrl: '',
+        useCookies: false,
+        usePoProvider: false,
+        youtubePlayerClients: 'web_safari',
+        timeoutMs: 30_000
+      });
+      return { info, proxyUrl: '', extractionRoute: 'direct-public-live-fallback' };
+    } catch (fallbackError) {
+      const primary = sanitizeSensitiveText(primaryError?.message).slice(-1400);
+      const fallback = sanitizeSensitiveText(fallbackError?.message).slice(-700);
+      throw new Error(`${primary}\nDIRECT_HLS_FALLBACK_FAILED: ${fallback}`);
+    }
+  }
 }
 
 function safeHttpHeaders(headers) {
@@ -1128,12 +1183,12 @@ async function resolvePageMedia(sourceUrl) {
   if (cached && cached.expiresAt > now) return cached.promise;
 
   const platform = extractorPlatform(sourceUrl);
-  const proxyUrl = proxyForPlatform(platform);
-  const promise = runYtDlpJson(sourceUrl)
-    .then(info => ({
+  const promise = runMediaExtractor(sourceUrl)
+    .then(({ info, proxyUrl, extractionRoute }) => ({
       ...pickResolvedInputs(info),
       platform,
       proxyUrl,
+      extractionRoute,
       ...liveStatusFromInfo(info)
     }))
     .then(resolved => enrichResolvedGeometry(resolved))
@@ -1399,7 +1454,8 @@ function smartLinkResolveError(sourceUrl, message) {
   const platform = extractorPlatform(sourceUrl);
   const lower = String(message || '').toLowerCase();
   const authLike = /sign in|log in|login|cookies?|not a bot|confirm you(?:'|’)re not a bot|authentication|private video|members-only|age-restricted/.test(lower);
-  const forbidden = /http error 403|forbidden|429|too many requests/.test(lower);
+  const rateLimited = youtubeRateLimited(lower);
+  const forbidden = /http error 403|forbidden/.test(lower);
   const timedOut = /ytdlp_timeout|timed out|không hoàn tất[^\n]*50 giây/.test(lower);
   const poTokenLike = /po token|proof[- ]of[- ]origin|gvs|missing[^\n]*token|token[^\n]*required|no video formats|requested format is not available|only images/.test(lower);
   const notStarted = /live event will begin|not yet started|scheduled for|upcoming|premiere will begin/.test(lower);
@@ -1412,6 +1468,15 @@ function smartLinkResolveError(sourceUrl, message) {
   if (platform === 'youtube' && notStarted) return {
     code: 'YOUTUBE_LIVE_NOT_STARTED', needsCookies: false, needsProxy: false,
     hint: 'Livestream này mới được lên lịch và chưa bắt đầu phát. Hãy thử lại khi YouTube đã hiện LIVE.'
+  };
+  // Check 429 before the generic "No video formats"/PO-token signature. yt-dlp
+  // reports the latter after an m3u8 request was rate-limited, but the first
+  // cause is the IP/session limit and generating another PO token cannot fix it.
+  if (platform === 'youtube' && rateLimited) return {
+    code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
+    hint: YTDLP_PROXY
+      ? 'YouTube trả HTTP 429 cho IP proxy hiện tại. Hãy bấm Đổi IP ở nhà cung cấp proxy hoặc thay YTDLP_PROXY; Gateway đã thử thêm đường HLS trực tiếp nhưng cả hai đều chưa lấy được luồng.'
+      : 'YouTube trả HTTP 429 cho IP máy chủ Render. Hãy chờ rồi thử lại hoặc cấu hình YTDLP_PROXY bằng proxy dân cư còn hoạt động.'
   };
   if (platform === 'youtube' && poTokenLike) return {
     code: 'YOUTUBE_PO_TOKEN_FAILED', needsCookies: false, needsProxy: false,
