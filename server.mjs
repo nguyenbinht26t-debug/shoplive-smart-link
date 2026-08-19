@@ -1,602 +1,1754 @@
 import http from 'node:http';
+import { spawn, execFile } from 'node:child_process';
+import { URL } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn, execFile } from 'node:child_process';
-import { URL } from 'node:url';
+import net from 'node:net';
+import dns from 'node:dns/promises';
 
-const VERSION = '2.8.7-online-worker-1session';
-const HOST = process.env.HOST || '0.0.0.0';
+function loadEnv(file = path.resolve('.env')) {
+  if (!fs.existsSync(file)) return;
+  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const i = line.indexOf('=');
+    if (i <= 0) continue;
+    const key = line.slice(0, i).trim();
+    let value = line.slice(i + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+loadEnv();
+
+const GATEWAY_VERSION = '2.8.7';
 const PORT = Number(process.env.PORT || 8787);
-const API_KEY = (process.env.WORKER_API_KEY || '').trim();
-const SMART_LINK_BASE_URL = (process.env.SMART_LINK_BASE_URL || 'https://shoplive-smart-link.onrender.com').replace(/\/$/, '');
-const SMART_LINK_KEY = (process.env.SMART_LINK_KEY || '').trim();
+const HOST = process.env.HOST || '0.0.0.0';
+const API_KEY = process.env.GATEWAY_API_KEY || '';
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
-const UPLOAD_DIR = process.env.UPLOAD_DIR || '/tmp/shoplive-online/uploads';
-const MAX_SESSIONS = 1;
-const MAX_UPLOAD_BYTES = numericSetting(process.env.MAX_UPLOAD_BYTES, 1610612736, 50 * 1024 * 1024);
-const MAX_RESTARTS = 6;
-const SESSION_RETENTION_MS = numericSetting(process.env.SESSION_RETENTION_MS, 6 * 60 * 60 * 1000, 60_000);
+const YTDLP = process.env.YTDLP || 'yt-dlp';
+const RESOLUTION = process.env.RESOLUTION || '720:1280';
+const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '2500k';
+// 1080p envelope that works for both orientations without cropping:
+// landscape <= 1920x1080, portrait <= 1080x1920, square <= 1080x1080.
+const SMART_LINK_MAX_SHORT_EDGE = 1080;
+const SMART_LINK_MAX_LONG_EDGE = 1920;
+let YTDLP_COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || '').trim();
+const YTDLP_COOKIES_B64 = (process.env.YTDLP_COOKIES_B64 || '').trim();
+const YOUTUBE_COOKIES_B64 = (process.env.YOUTUBE_COOKIES_B64 || '').trim();
+const FACEBOOK_COOKIES_B64 = (process.env.FACEBOOK_COOKIES_B64 || '').trim();
+const YTDLP_PROXY = (process.env.YTDLP_PROXY || '').trim();
+const META_PROXY = (process.env.META_PROXY || '').trim();
+const YTDLP_IMPERSONATE = (process.env.YTDLP_IMPERSONATE || '').trim();
+const YOUTUBE_PLAYER_CLIENTS = (process.env.YOUTUBE_PLAYER_CLIENTS || '').trim();
+const YOUTUBE_PO_PROVIDER_HOME = (process.env.YOUTUBE_PO_PROVIDER_HOME || '/opt/bgutil-ytdlp-pot-provider/server').trim();
+const YOUTUBE_PO_PROVIDER_AVAILABLE = Boolean(YOUTUBE_PO_PROVIDER_HOME && fs.existsSync(YOUTUBE_PO_PROVIDER_HOME));
+const configuredPoPort = Number(process.env.YOUTUBE_PO_PROVIDER_PORT || 4416);
+const YOUTUBE_PO_PROVIDER_PORT = Number.isInteger(configuredPoPort) && configuredPoPort > 0 && configuredPoPort <= 65535
+  ? configuredPoPort
+  : 4416;
+const YOUTUBE_PO_PROVIDER_ENTRY = path.join(YOUTUBE_PO_PROVIDER_HOME, 'build', 'main.js');
+let youtubePoHttpProcess = null;
+let youtubePoHttpRunning = false;
+let youtubePoRestartTimer = null;
+let shuttingDown = false;
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+function effectiveYoutubePlayerClients() {
+  const clients = YOUTUBE_PLAYER_CLIENTS
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  if (YOUTUBE_PO_PROVIDER_AVAILABLE) {
+    // For an active livestream, web_safari exposes HLS without requiring a GVS
+    // PO token. Keep mweb immediately behind it so normal/account-restricted
+    // videos can still use the installed PO provider. This order is important:
+    // a rate-limited mweb manifest must not prevent the HLS client from trying.
+    return [...new Set(['web_safari', 'mweb', ...clients])].join(',');
+  }
+  return [...new Set(clients)].join(',');
+}
 
-const sessions = new Map();
-const uploads = new Map();
-let pendingSessionCreates = 0;
+const EFFECTIVE_YOUTUBE_PLAYER_CLIENTS = effectiveYoutubePlayerClients();
 
-function numericSetting(value, fallback, min, max = Number.MAX_SAFE_INTEGER) {
-  const parsed = Number(value);
-  const safe = Number.isFinite(parsed) ? parsed : fallback;
-  return Math.max(min, Math.min(max, safe));
+function cookieFileFromBase64(value, filename, label) {
+  if (!value) return '';
+  try {
+    const file = `/tmp/${filename}`;
+    const decoded = Buffer.from(value, 'base64');
+    if (!decoded.length) throw new Error('cookie data is empty');
+    fs.writeFileSync(file, decoded, { mode: 0o600 });
+    console.log(`[yt-dlp cookies] loaded ${label} cookie file (${decoded.length} bytes)`);
+    return file;
+  } catch (e) {
+    console.error(`[yt-dlp cookies] cannot decode ${label}:`, e.message);
+    return '';
+  }
+}
+
+if (!YTDLP_COOKIES_FILE && YTDLP_COOKIES_B64) {
+  YTDLP_COOKIES_FILE = cookieFileFromBase64(YTDLP_COOKIES_B64, 'shoplive-ytdlp-cookies.txt', 'YTDLP_COOKIES_B64');
+}
+const YOUTUBE_COOKIES_FILE = cookieFileFromBase64(YOUTUBE_COOKIES_B64, 'shoplive-youtube-cookies.txt', 'YOUTUBE_COOKIES_B64');
+const FACEBOOK_COOKIES_FILE = cookieFileFromBase64(FACEBOOK_COOKIES_B64, 'shoplive-facebook-cookies.txt', 'FACEBOOK_COOKIES_B64');
+
+// OAuth account connection broker. Provider app secrets stay on the Gateway, never in the APK.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID || '';
+const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET || '';
+const FACEBOOK_GRAPH_VERSION = process.env.FACEBOOK_GRAPH_VERSION || 'v26.0';
+const TIKTOK_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || '';
+const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || '';
+const SHOPEE_PARTNER_ID = process.env.SHOPEE_PARTNER_ID || '';
+const SHOPEE_PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY || '';
+const SHOPEE_HOST = (process.env.SHOPEE_HOST || 'https://partner.shopeemobile.com').replace(/\/$/, '');
+const OAUTH_STORE_KEY = process.env.OAUTH_STORE_KEY || '';
+const OAUTH_STORE_FILE = path.resolve(process.env.OAUTH_STORE_FILE || './data/oauth-connections.enc.json');
+const APP_RETURN_URI = 'shopliveai://oauth/callback';
+const oauthStates = new Map();
+const oauthConnections = new Map();
+
+function b64url(bytes) {
+  return Buffer.from(bytes).toString('base64url');
+}
+
+function randomId(bytes = 24) {
+  return b64url(crypto.randomBytes(bytes));
+}
+
+function secureCookieState(req) {
+  const raw = req.headers.cookie || '';
+  for (const item of raw.split(';')) {
+    const [key, ...rest] = item.trim().split('=');
+    if (key === 'shoplive_oauth_state') return decodeURIComponent(rest.join('='));
+  }
+  return '';
+}
+
+function setStateCookie(res, state) {
+  res.setHeader('set-cookie', `shoplive_oauth_state=${encodeURIComponent(state)}; Max-Age=600; Path=/oauth; HttpOnly; SameSite=Lax; Secure`);
+}
+
+function publicCallback(platform) {
+  if (!PUBLIC_BASE_URL.startsWith('https://')) {
+    throw new Error('PUBLIC_BASE_URL phải là HTTPS public để dùng đăng nhập nền tảng');
+  }
+  return `${PUBLIC_BASE_URL}/oauth/${platform}/callback`;
+}
+
+function pruneStates() {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [key, value] of oauthStates) if (value.createdAt < cutoff) oauthStates.delete(key);
+}
+
+function stateFor(platform, appReturn) {
+  pruneStates();
+  if (appReturn !== APP_RETURN_URI) throw new Error('app_return không hợp lệ');
+  const state = randomId();
+  oauthStates.set(state, { platform, appReturn, createdAt: Date.now() });
+  return state;
+}
+
+function takeState(state, expectedPlatform) {
+  pruneStates();
+  const value = oauthStates.get(state);
+  if (!value || value.platform !== expectedPlatform) return null;
+  oauthStates.delete(state);
+  return value;
+}
+
+function appRedirect(res, platform, status, details = {}) {
+  const target = new URL(APP_RETURN_URI);
+  target.searchParams.set('platform', platform.toUpperCase());
+  target.searchParams.set('status', status);
+  if (details.connectionId) target.searchParams.set('connection_id', details.connectionId);
+  if (details.accountName) target.searchParams.set('account_name', details.accountName);
+  if (details.destinationId) target.searchParams.set('destination_id', details.destinationId);
+  if (details.destinationName) target.searchParams.set('destination_name', details.destinationName);
+  if (details.message) target.searchParams.set('message', String(details.message).slice(0, 300));
+  res.writeHead(302, { location: target.toString(), 'cache-control': 'no-store' });
+  res.end();
+}
+
+function oauthConfigOk(platform) {
+  if (!PUBLIC_BASE_URL.startsWith('https://')) return 'PUBLIC_BASE_URL phải là URL HTTPS public';
+  if (platform === 'facebook' && (!FACEBOOK_APP_ID || !FACEBOOK_APP_SECRET)) return 'Thiếu FACEBOOK_APP_ID / FACEBOOK_APP_SECRET';
+  if (platform === 'tiktok' && (!TIKTOK_CLIENT_KEY || !TIKTOK_CLIENT_SECRET)) return 'Thiếu TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET';
+  if (platform === 'shopee' && (!SHOPEE_PARTNER_ID || !SHOPEE_PARTNER_KEY)) return 'Thiếu SHOPEE_PARTNER_ID / SHOPEE_PARTNER_KEY';
+  return '';
+}
+
+function encryptConnections() {
+  if (!OAUTH_STORE_KEY) return null;
+  const key = crypto.createHash('sha256').update(OAUTH_STORE_KEY).digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plain = Buffer.from(JSON.stringify([...oauthConnections.entries()]), 'utf8');
+  const encrypted = Buffer.concat([cipher.update(plain), cipher.final()]);
+  return { v: 1, iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: encrypted.toString('base64') };
+}
+
+function saveConnections() {
+  const payload = encryptConnections();
+  if (!payload) return;
+  fs.mkdirSync(path.dirname(OAUTH_STORE_FILE), { recursive: true });
+  fs.writeFileSync(OAUTH_STORE_FILE, JSON.stringify(payload), { mode: 0o600 });
+}
+
+function loadConnections() {
+  if (!OAUTH_STORE_KEY || !fs.existsSync(OAUTH_STORE_FILE)) return;
+  try {
+    const payload = JSON.parse(fs.readFileSync(OAUTH_STORE_FILE, 'utf8'));
+    const key = crypto.createHash('sha256').update(OAUTH_STORE_KEY).digest();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(payload.tag, 'base64'));
+    const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64')), decipher.final()]).toString('utf8');
+    for (const [id, value] of JSON.parse(plain)) oauthConnections.set(id, value);
+  } catch (e) {
+    console.error('[oauth store] cannot decrypt saved connections:', e.message);
+  }
+}
+loadConnections();
+
+function saveConnection(platform, accountName, tokens, extra = {}) {
+  const connectionId = randomId(18);
+  oauthConnections.set(connectionId, {
+    platform,
+    accountName,
+    tokens,
+    extra,
+    updatedAt: new Date().toISOString()
+  });
+  saveConnections();
+  return connectionId;
+}
+
+function hmacSha256Hex(key, text) {
+  return crypto.createHmac('sha256', key).update(text).digest('hex');
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let body;
+  try { body = text ? JSON.parse(text) : {}; }
+  catch { throw new Error(`HTTP ${response.status}: ${text.slice(0, 240)}`); }
+  if (!response.ok) {
+    const graphError = body?.error?.message || body?.error?.error_user_msg || '';
+    throw new Error(body.error_description || body.message || graphError || (typeof body.error === 'string' ? body.error : '') || `HTTP ${response.status}`);
+  }
+  if (body?.error) {
+    const graphError = body.error.message || body.error.error_user_msg || body.error.type || 'Provider API error';
+    throw new Error(graphError);
+  }
+  return body;
+}
+
+async function oauthStart(req, res, requestUrl, platform) {
+  const error = oauthConfigOk(platform);
+  if (error) return json(res, 503, { ok: false, error });
+  const appReturn = requestUrl.searchParams.get('app_return') || '';
+  let state;
+  try { state = stateFor(platform, appReturn); }
+  catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+  setStateCookie(res, state);
+
+  if (platform === 'facebook') {
+    const auth = new URL('https://www.facebook.com/dialog/oauth');
+    auth.searchParams.set('client_id', FACEBOOK_APP_ID);
+    auth.searchParams.set('redirect_uri', publicCallback('facebook'));
+    auth.searchParams.set('state', state);
+    auth.searchParams.set('response_type', 'code');
+    auth.searchParams.set('scope', 'public_profile,pages_show_list,publish_video');
+    res.writeHead(302, { location: auth.toString(), 'cache-control': 'no-store' });
+    return res.end();
+  }
+
+  if (platform === 'tiktok') {
+    const auth = new URL('https://www.tiktok.com/v2/auth/authorize/');
+    auth.searchParams.set('client_key', TIKTOK_CLIENT_KEY);
+    auth.searchParams.set('redirect_uri', publicCallback('tiktok'));
+    auth.searchParams.set('state', state);
+    auth.searchParams.set('response_type', 'code');
+    auth.searchParams.set('scope', 'user.info.basic');
+    res.writeHead(302, { location: auth.toString(), 'cache-control': 'no-store' });
+    return res.end();
+  }
+
+  if (platform === 'shopee') {
+    const apiPath = '/api/v2/shop/auth_partner';
+    const timestamp = Math.floor(Date.now() / 1000);
+    const sign = hmacSha256Hex(SHOPEE_PARTNER_KEY, `${SHOPEE_PARTNER_ID}${apiPath}${timestamp}`);
+    const callback = publicCallback('shopee');
+    const auth = new URL(`${SHOPEE_HOST}${apiPath}`);
+    auth.searchParams.set('partner_id', SHOPEE_PARTNER_ID);
+    auth.searchParams.set('timestamp', String(timestamp));
+    auth.searchParams.set('sign', sign);
+    auth.searchParams.set('redirect', callback);
+    res.writeHead(302, { location: auth.toString(), 'cache-control': 'no-store' });
+    return res.end();
+  }
+
+  return json(res, 404, { ok: false, error: 'unsupported platform' });
+}
+
+async function oauthCallback(req, res, requestUrl, platform) {
+  const returnedState = requestUrl.searchParams.get('state') || secureCookieState(req);
+  const state = takeState(returnedState, platform);
+  if (!state) return appRedirect(res, platform, 'error', { message: 'Phiên đăng nhập đã hết hạn hoặc state không hợp lệ' });
+  const providerError = requestUrl.searchParams.get('error') || requestUrl.searchParams.get('error_description');
+  if (providerError) return appRedirect(res, platform, 'error', { message: providerError });
+
+  try {
+    if (platform === 'facebook') {
+      const code = requestUrl.searchParams.get('code');
+      if (!code) throw new Error('Facebook không trả authorization code');
+      const graphBase = `https://graph.facebook.com/${FACEBOOK_GRAPH_VERSION}`;
+      const tokenUrl = new URL(`${graphBase}/oauth/access_token`);
+      tokenUrl.searchParams.set('client_id', FACEBOOK_APP_ID);
+      tokenUrl.searchParams.set('client_secret', FACEBOOK_APP_SECRET);
+      tokenUrl.searchParams.set('redirect_uri', publicCallback('facebook'));
+      tokenUrl.searchParams.set('code', code);
+      const shortToken = await fetchJson(tokenUrl);
+
+      // Exchange for a long-lived user token when Meta allows it. If exchange fails,
+      // keep the original token so development/test users can still continue.
+      let token = shortToken;
+      try {
+        const longUrl = new URL(`${graphBase}/oauth/access_token`);
+        longUrl.searchParams.set('grant_type', 'fb_exchange_token');
+        longUrl.searchParams.set('client_id', FACEBOOK_APP_ID);
+        longUrl.searchParams.set('client_secret', FACEBOOK_APP_SECRET);
+        longUrl.searchParams.set('fb_exchange_token', shortToken.access_token);
+        const longToken = await fetchJson(longUrl);
+        if (longToken.access_token) token = { ...shortToken, ...longToken };
+      } catch (e) {
+        console.warn('[facebook] long-lived token exchange skipped:', e.message);
+      }
+
+      const profileUrl = new URL(`${graphBase}/me`);
+      profileUrl.searchParams.set('fields', 'id,name');
+      profileUrl.searchParams.set('access_token', token.access_token);
+      const profile = await fetchJson(profileUrl);
+      const accountName = profile.name || `Facebook ${profile.id || ''}`.trim();
+      const connectionId = saveConnection('facebook', accountName, token, { userId: profile.id || '' });
+      // Default to the user's own profile; the Android app can switch to any managed Page later.
+      return appRedirect(res, platform, 'ok', {
+        connectionId,
+        accountName,
+        destinationId: `user:${profile.id || ''}`,
+        destinationName: `${accountName} (Trang cá nhân)`
+      });
+    }
+
+    if (platform === 'tiktok') {
+      const code = requestUrl.searchParams.get('code');
+      if (!code) throw new Error('TikTok không trả authorization code');
+      const body = new URLSearchParams({
+        client_key: TIKTOK_CLIENT_KEY,
+        client_secret: TIKTOK_CLIENT_SECRET,
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: publicCallback('tiktok')
+      });
+      const token = await fetchJson('https://open.tiktokapis.com/v2/oauth/token/', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body
+      });
+      const profile = await fetchJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,avatar_url', {
+        headers: { authorization: `Bearer ${token.access_token}` }
+      });
+      const user = profile?.data?.user || {};
+      const accountName = user.display_name || `TikTok ${token.open_id || user.open_id || ''}`.trim();
+      const connectionId = saveConnection('tiktok', accountName, token, { openId: token.open_id || user.open_id || '' });
+      return appRedirect(res, platform, 'ok', { connectionId, accountName });
+    }
+
+    if (platform === 'shopee') {
+      const code = requestUrl.searchParams.get('code');
+      const shopId = requestUrl.searchParams.get('shop_id');
+      if (!code || !shopId) throw new Error('Shopee không trả code/shop_id');
+      const apiPath = '/api/v2/auth/token/get';
+      const timestamp = Math.floor(Date.now() / 1000);
+      const sign = hmacSha256Hex(SHOPEE_PARTNER_KEY, `${SHOPEE_PARTNER_ID}${apiPath}${timestamp}`);
+      const tokenUrl = new URL(`${SHOPEE_HOST}${apiPath}`);
+      tokenUrl.searchParams.set('partner_id', SHOPEE_PARTNER_ID);
+      tokenUrl.searchParams.set('timestamp', String(timestamp));
+      tokenUrl.searchParams.set('sign', sign);
+      const token = await fetchJson(tokenUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code, shop_id: Number(shopId), partner_id: Number(SHOPEE_PARTNER_ID) })
+      });
+      if (token.error) throw new Error(token.message || token.error);
+      const accountName = `Shopee Shop ${shopId}`;
+      const connectionId = saveConnection('shopee', accountName, token, { shopId: Number(shopId) });
+      return appRedirect(res, platform, 'ok', { connectionId, accountName });
+    }
+
+    return appRedirect(res, platform, 'error', { message: 'Nền tảng chưa được hỗ trợ' });
+  } catch (e) {
+    console.error(`[oauth ${platform}]`, e);
+    return appRedirect(res, platform, 'error', { message: e.message || 'Đăng nhập thất bại' });
+  }
 }
 
 function json(res, status, body) {
-  const text = JSON.stringify(body);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
-    'cache-control': 'no-store'
-  });
-  res.end(text);
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(body));
 }
 
-function readJson(req, limit = 256 * 1024) {
+function keyOk(req, requestUrl) {
+  if (!API_KEY) return true;
+  const header = req.headers['x-shoplive-key'];
+  const query = requestUrl.searchParams.get('key');
+  return header === API_KEY || query === API_KEY;
+}
+
+function commandExists(command) {
+  const executable = path.basename(String(command || '')).toLowerCase();
+  const versionArg = executable.startsWith('ffmpeg') || executable.startsWith('ffprobe')
+    ? '-version'
+    : '--version';
+  return new Promise(resolve => {
+    execFile(command, [versionArg], { timeout: 4000 }, error => resolve(!error));
+  });
+}
+
+function sanitizeSensitiveText(value) {
+  return String(value || '')
+    .replace(/((?:https?|socks(?:4|5)h?):\/\/)([^@\s/]+)@/gi, '$1***:***@')
+    .replace(/(--proxy(?:=|\s+))\S+/gi, '$1[REDACTED]')
+    .replace(/(--cookies(?:=|\s+))\S+/gi, '$1[COOKIE_FILE]');
+}
+
+function withOutboundProxyEnv(baseEnv, proxyUrl) {
+  if (!proxyUrl) return baseEnv;
+  return {
+    ...baseEnv,
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    ALL_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    all_proxy: proxyUrl,
+    NO_PROXY: '127.0.0.1,localhost,::1',
+    no_proxy: '127.0.0.1,localhost,::1'
+  };
+}
+
+function scheduleYoutubePoProviderRestart() {
+  if (shuttingDown || youtubePoRestartTimer || !YOUTUBE_PO_PROVIDER_AVAILABLE) return;
+  youtubePoRestartTimer = setTimeout(() => {
+    youtubePoRestartTimer = null;
+    startYoutubePoProvider();
+  }, 3000);
+  youtubePoRestartTimer.unref();
+}
+
+function startYoutubePoProvider() {
+  if (!YOUTUBE_PO_PROVIDER_AVAILABLE || !fs.existsSync(YOUTUBE_PO_PROVIDER_ENTRY)) {
+    console.warn('[youtube po] HTTP provider build is unavailable; script fallback remains enabled');
+    return;
+  }
+  if (youtubePoHttpProcess) return;
+
+  const providerEnv = withOutboundProxyEnv({ ...process.env }, YTDLP_PROXY);
+  const child = spawn(
+    process.execPath,
+    [YOUTUBE_PO_PROVIDER_ENTRY, '--port', String(YOUTUBE_PO_PROVIDER_PORT)],
+    { env: providerEnv, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true }
+  );
+  youtubePoHttpProcess = child;
+
+  child.on('spawn', () => {
+    youtubePoHttpRunning = true;
+    console.log(`[youtube po] HTTP provider started on localhost:${YOUTUBE_PO_PROVIDER_PORT}`);
+  });
+  child.stderr.on('data', chunk => {
+    const safe = sanitizeSensitiveText(chunk).trim();
+    if (safe) console.warn('[youtube po]', safe.slice(-1000));
+  });
+  child.on('error', error => {
+    if (youtubePoHttpProcess === child) youtubePoHttpProcess = null;
+    youtubePoHttpRunning = false;
+    console.error('[youtube po] start failed:', sanitizeSensitiveText(error?.message).slice(0, 500));
+    scheduleYoutubePoProviderRestart();
+  });
+  child.on('exit', (code, signal) => {
+    youtubePoHttpProcess = null;
+    youtubePoHttpRunning = false;
+    if (!shuttingDown) {
+      console.warn(`[youtube po] stopped (${code ?? signal ?? 'unknown'}), restarting`);
+      scheduleYoutubePoProviderRestart();
+    }
+  });
+}
+
+function readJsonBody(req, maxBytes = 32 * 1024) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
     let size = 0;
+    let text = '';
+    req.setEncoding('utf8');
     req.on('data', chunk => {
-      size += chunk.length;
-      if (size > limit) {
-        reject(new Error('JSON body quá lớn'));
+      size += Buffer.byteLength(chunk);
+      if (size > maxBytes) {
+        reject(new Error('request body too large'));
         req.destroy();
         return;
       }
-      chunks.push(chunk);
+      text += chunk;
     });
     req.on('end', () => {
-      try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); }
-      catch { reject(new Error('JSON không hợp lệ')); }
+      try { resolve(text ? JSON.parse(text) : {}); }
+      catch { reject(new Error('JSON body không hợp lệ')); }
     });
     req.on('error', reject);
   });
 }
 
-function authorized(req) {
-  if (!API_KEY) return false;
-  const header = String(req.headers['x-shoplive-key'] || '');
-  const actual = Buffer.from(header);
-  const expected = Buffer.from(API_KEY);
-  if (actual.length !== expected.length) return false;
-  return crypto.timingSafeEqual(actual, expected);
+function requireFacebookConnection(connectionId) {
+  const connection = oauthConnections.get(String(connectionId || ''));
+  if (!connection || connection.platform !== 'facebook') throw new Error('Liên kết Facebook không hợp lệ hoặc đã hết hạn');
+  if (!connection.tokens?.access_token) throw new Error('Facebook access token không còn tồn tại trên máy chủ');
+  return connection;
 }
 
-function safeId(value) {
-  return /^[a-zA-Z0-9_-]{6,80}$/.test(value || '') ? value : '';
+async function facebookPageAccounts(connection) {
+  const graphBase = `https://graph.facebook.com/${FACEBOOK_GRAPH_VERSION}`;
+  const url = new URL(`${graphBase}/me/accounts`);
+  url.searchParams.set('fields', 'id,name,access_token,tasks');
+  url.searchParams.set('limit', '100');
+  url.searchParams.set('access_token', connection.tokens.access_token);
+  const body = await fetchJson(url);
+  return Array.isArray(body.data) ? body.data : [];
 }
 
-function randomId(prefix) {
-  return `${prefix}_${crypto.randomBytes(10).toString('hex')}`;
+async function facebookDestinations(connection) {
+  const userId = String(connection.extra?.userId || '');
+  const destinations = [];
+  if (userId) {
+    destinations.push({ id: `user:${userId}`, name: `${connection.accountName} (Trang cá nhân)`, type: 'user' });
+  }
+  const pages = await facebookPageAccounts(connection);
+  for (const page of pages) {
+    if (!page?.id || !page?.access_token) continue;
+    destinations.push({ id: `page:${page.id}`, name: page.name || `Page ${page.id}`, type: 'page' });
+  }
+  return destinations;
 }
 
-function activeSessionCount() {
-  let count = 0;
-  for (const s of sessions.values()) if (s.shouldRun && ['STARTING', 'RUNNING', 'RECONNECTING'].includes(s.state)) count++;
-  return count;
+async function resolveFacebookDestination(connection, destinationId) {
+  const raw = String(destinationId || '');
+  if (raw.startsWith('user:')) {
+    const id = raw.slice(5);
+    if (!id || id !== String(connection.extra?.userId || '')) throw new Error('Trang cá nhân Facebook không khớp tài khoản đã liên kết');
+    return { id, name: connection.accountName, type: 'user', accessToken: connection.tokens.access_token, publicId: raw };
+  }
+  if (raw.startsWith('page:')) {
+    const id = raw.slice(5);
+    const pages = await facebookPageAccounts(connection);
+    const page = pages.find(item => String(item.id) === id);
+    if (!page?.access_token) throw new Error('Không lấy được quyền phát lên Page này. Hãy liên kết lại Facebook và cấp đủ quyền.');
+    return { id, name: page.name || `Page ${id}`, type: 'page', accessToken: page.access_token, publicId: raw };
+  }
+  throw new Error('Chưa chọn Trang cá nhân/Page Facebook để phát');
 }
 
-function publicSession(s) {
-  return {
-    id: s.id,
-    state: s.state,
-    sourceType: s.sourceType,
-    sourceLabel: s.sourceLabel,
-    bitrate: s.bitrate || '',
-    speed: s.speed || '',
-    frame: s.frame || 0,
-    restartCount: s.restartCount || 0,
-    loopCount: s.loopCount || 0,
-    lastProgressAt: s.lastProgressAt ? new Date(s.lastProgressAt).toISOString() : '',
-    createdAt: s.createdAt,
-    updatedAt: s.updatedAt,
-    error: s.error || ''
-  };
+async function handleFacebookDestinations(req, res) {
+  const body = await readJsonBody(req);
+  const connection = requireFacebookConnection(body.connection_id);
+  const destinations = await facebookDestinations(connection);
+  return json(res, 200, { ok: true, destinations });
 }
 
-function commandOk(command, args) {
-  return new Promise(resolve => {
-    execFile(command, args, { timeout: 8000 }, err => resolve(!err));
+async function handleFacebookLiveStart(req, res) {
+  const body = await readJsonBody(req);
+  const connection = requireFacebookConnection(body.connection_id);
+  const destination = await resolveFacebookDestination(connection, body.destination_id);
+  const graphBase = `https://graph.facebook.com/${FACEBOOK_GRAPH_VERSION}`;
+  const url = new URL(`${graphBase}/${encodeURIComponent(destination.id)}/live_videos`);
+  const form = new URLSearchParams();
+  form.set('status', 'LIVE_NOW');
+  form.set('title', String(body.title || 'ShopLive AI').slice(0, 255));
+  const description = String(body.description || '').slice(0, 5000);
+  if (description) form.set('description', description);
+  form.set('access_token', destination.accessToken);
+
+  const created = await fetchJson(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: form
   });
-}
+  const liveVideoId = String(created.id || '');
+  if (!liveVideoId) throw new Error('Facebook không trả LiveVideo ID');
 
-async function smartLinkInput(rawUrl) {
-  const target = new URL(rawUrl);
-  const host = target.hostname.toLowerCase();
-  const pageLink = host === 'youtu.be' || host.endsWith('youtube.com') || host.endsWith('facebook.com') ||
-    host === 'fb.watch' || host.endsWith('tiktok.com') || host.endsWith('vimeo.com') || host.endsWith('instagram.com');
-  if (!pageLink) return { input: rawUrl, kind: 'direct-url', h264Aac: false, sourceLabel: target.hostname };
-
-  const probeUrl = new URL(`${SMART_LINK_BASE_URL}/api/probe-v5`);
-  probeUrl.searchParams.set('url', rawUrl);
-  const probeHeaders = { accept: 'application/json' };
-  if (SMART_LINK_KEY) probeHeaders['x-shoplive-key'] = SMART_LINK_KEY;
-  const response = await fetch(probeUrl, { headers: probeHeaders, signal: AbortSignal.timeout(120000) });
-  const text = await response.text();
-  let probe = {};
-  try { probe = text ? JSON.parse(text) : {}; } catch {}
-  if (!response.ok) throw new Error(probe.error || probe.hint || `Smart Link probe HTTP ${response.status}`);
-  const width = Number(probe.encoderWidth || probe.displayWidth || 0);
-  const height = Number(probe.encoderHeight || probe.displayHeight || 0);
-  if (!(width > 0 && height > 0)) throw new Error('Smart Link không trả kích thước native');
-
-  const sourceUrl = new URL(`${SMART_LINK_BASE_URL}/api/source-v5`);
-  sourceUrl.searchParams.set('url', rawUrl);
-  sourceUrl.searchParams.set('container', 'flv');
-  sourceUrl.searchParams.set('w', String(width));
-  sourceUrl.searchParams.set('h', String(height));
-  return {
-    input: sourceUrl.toString(),
-    inputHeaders: SMART_LINK_KEY ? `X-ShopLive-Key: ${SMART_LINK_KEY}\r\n` : '',
-    kind: 'smart-link',
-    h264Aac: true,
-    sourceLabel: `${host} ${width}x${height}`
-  };
-}
-
-function ffprobeJson(input) {
-  return new Promise((resolve, reject) => {
-    const args = ['-v', 'error', '-show_entries', 'stream=index,codec_type,codec_name,width,height:stream_tags=rotate:stream_side_data=rotation', '-of', 'json', input];
-    execFile(FFPROBE, args, { timeout: 25000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(`ffprobe: ${(stderr || err.message).slice(-400)}`));
-      try { resolve(JSON.parse(stdout || '{}')); }
-      catch { reject(new Error('ffprobe trả JSON lỗi')); }
-    });
-  });
-}
-
-async function inputPlan(sourceType, sourceUrl, uploadId) {
-  if (sourceType === 'upload') {
-    const id = safeId(uploadId);
-    if (!id) throw new Error('uploadId không hợp lệ');
-    const meta = uploads.get(id);
-    const file = meta?.path || path.join(UPLOAD_DIR, id);
-    if (!fs.existsSync(file)) throw new Error('Video upload không còn trên worker');
-    const probe = await ffprobeJson(file);
-    const streams = Array.isArray(probe.streams) ? probe.streams : [];
-    const v = streams.find(x => x.codec_type === 'video');
-    const a = streams.find(x => x.codec_type === 'audio');
-    if (!v) throw new Error('File upload không có track video');
-    const rotation = Number(v.tags?.rotate || v.side_data_list?.find?.(x => x.rotation != null)?.rotation || 0);
-    const canCopyVideo = String(v.codec_name).toLowerCase() === 'h264' && rotation === 0;
-    const canCopyAudio = a && String(a.codec_name).toLowerCase() === 'aac';
-    return {
-      input: file,
-      kind: 'upload',
-      sourceLabel: meta?.filename || `upload ${id}`,
-      hasAudio: !!a,
-      copyVideo: canCopyVideo,
-      copyAudio: !!canCopyAudio
-    };
+  let secureStreamUrl = String(created.secure_stream_url || '');
+  if (!secureStreamUrl) {
+    const detailUrl = new URL(`${graphBase}/${encodeURIComponent(liveVideoId)}`);
+    detailUrl.searchParams.set('fields', 'secure_stream_url,status');
+    detailUrl.searchParams.set('access_token', destination.accessToken);
+    const detail = await fetchJson(detailUrl);
+    secureStreamUrl = String(detail.secure_stream_url || '');
+  }
+  if (!secureStreamUrl.startsWith('rtmps://')) {
+    // Do not downgrade to insecure RTMP. Meta's current Live requirements use RTMPS.
+    throw new Error('Facebook không trả secure_stream_url (RTMPS). Kiểm tra quyền Live Video API của Meta App.');
   }
 
-  if (sourceType === 'url') {
-    if (!/^https?:\/\//i.test(sourceUrl || '')) throw new Error('sourceUrl phải là http/https');
-    const resolved = await smartLinkInput(sourceUrl);
-    if (resolved.kind === 'smart-link') {
-      return { ...resolved, hasAudio: true, copyVideo: true, copyAudio: true };
+  return json(res, 200, {
+    ok: true,
+    live_video_id: liveVideoId,
+    secure_stream_url: secureStreamUrl,
+    destination_id: destination.publicId,
+    destination_name: destination.name
+  });
+}
+
+async function handleFacebookLiveStatus(req, res) {
+  const body = await readJsonBody(req);
+  const connection = requireFacebookConnection(body.connection_id);
+  const destination = await resolveFacebookDestination(connection, body.destination_id);
+  const liveVideoId = String(body.live_video_id || '');
+  if (!liveVideoId) throw new Error('Thiếu LiveVideo ID');
+  const graphBase = `https://graph.facebook.com/${FACEBOOK_GRAPH_VERSION}`;
+  const url = new URL(`${graphBase}/${encodeURIComponent(liveVideoId)}`);
+  url.searchParams.set('fields', 'status');
+  url.searchParams.set('access_token', destination.accessToken);
+  const detail = await fetchJson(url);
+  return json(res, 200, { ok: true, status: String(detail.status || 'UNKNOWN') });
+}
+
+async function handleFacebookLiveEnd(req, res) {
+  const body = await readJsonBody(req);
+  const connection = requireFacebookConnection(body.connection_id);
+  const destination = await resolveFacebookDestination(connection, body.destination_id);
+  const liveVideoId = String(body.live_video_id || '');
+  if (!liveVideoId) throw new Error('Thiếu LiveVideo ID');
+  const graphBase = `https://graph.facebook.com/${FACEBOOK_GRAPH_VERSION}`;
+  const url = new URL(`${graphBase}/${encodeURIComponent(liveVideoId)}`);
+  const form = new URLSearchParams({ end_live_video: 'true', access_token: destination.accessToken });
+  const result = await fetchJson(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: form
+  });
+  return json(res, 200, { ok: true, success: result.success !== false });
+}
+
+function isPrivateIpv4(ip) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(v => !Number.isInteger(v) || v < 0 || v > 255)) return true;
+  const [a, b] = parts;
+  return a === 10 || a === 127 || a === 0 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    a >= 224;
+}
+
+function isPrivateAddress(ip) {
+  const kind = net.isIP(ip);
+  if (kind === 4) return isPrivateIpv4(ip);
+  if (kind === 6) {
+    const value = ip.toLowerCase();
+    return value === '::1' || value === '::' || value.startsWith('fc') || value.startsWith('fd') ||
+      value.startsWith('fe8') || value.startsWith('fe9') || value.startsWith('fea') || value.startsWith('feb') ||
+      value.startsWith('::ffff:127.') || value.startsWith('::ffff:10.') || value.startsWith('::ffff:192.168.');
+  }
+  return true;
+}
+
+function supportedShareHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^www\./, '');
+  return host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com') ||
+    host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'fb.watch' ||
+    host === 'tiktok.com' || host.endsWith('.tiktok.com') ||
+    host === 'vimeo.com' || host.endsWith('.vimeo.com') ||
+    host === 'instagram.com' || host.endsWith('.instagram.com');
+}
+
+function looksDirectMedia(parsed) {
+  return /\.(m3u8|mpd|mp4|mov|m4v|webm|mkv|ts)(?:$|[?#])/i.test(parsed.href);
+}
+
+async function safePublicUrl(raw) {
+  const parsed = new URL(raw);
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Chỉ nhận link http/https');
+  if (parsed.username || parsed.password) throw new Error('Không nhận URL có user/password');
+  const host = parsed.hostname.toLowerCase();
+  if (!host || host === 'localhost' || host.endsWith('.local')) throw new Error('Không nhận địa chỉ nội bộ');
+
+  // Resolver is intentionally limited to known public video pages or obvious direct media URLs.
+  if (!supportedShareHost(host) && !looksDirectMedia(parsed)) {
+    throw new Error('Link chưa được Smart Link hỗ trợ');
+  }
+
+  const directIp = net.isIP(host);
+  if (directIp && isPrivateAddress(host)) throw new Error('Không nhận IP nội bộ/private');
+  if (!directIp) {
+    const answers = await dns.lookup(host, { all: true, verbatim: true });
+    if (!answers.length || answers.some(item => isPrivateAddress(item.address))) {
+      throw new Error('Tên miền trỏ tới địa chỉ nội bộ/private');
     }
-    let probe = null;
-    try { probe = await ffprobeJson(resolved.input); } catch {}
-    const streams = Array.isArray(probe?.streams) ? probe.streams : [];
-    const v = streams.find(x => x.codec_type === 'video');
-    const a = streams.find(x => x.codec_type === 'audio');
-    const rotation = Number(v?.tags?.rotate || v?.side_data_list?.find?.(x => x.rotation != null)?.rotation || 0);
-    return {
-      ...resolved,
-      hasAudio: !!a,
-      copyVideo: !!v && String(v.codec_name).toLowerCase() === 'h264' && rotation === 0,
-      copyAudio: !!a && String(a.codec_name).toLowerCase() === 'aac'
-    };
   }
-  throw new Error('sourceType chỉ nhận upload hoặc url');
+  return parsed.toString();
 }
 
-function buildFfmpegArgs(session) {
-  const p = session.plan;
-  // Machine-readable progress is required here. Normal FFmpeg status output is not
-  // reliable for stream-copy and may omit frame= even while RTMP bytes are flowing.
-  const args = ['-hide_banner', '-loglevel', 'info', '-nostats', '-progress', 'pipe:2'];
-  if (p.kind !== 'upload') {
-    args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '8',
-      '-rw_timeout', '120000000', '-thread_queue_size', '4096');
+const sourceResolveCache = new Map();
+
+function extractorPlatform(sourceUrl) {
+  const host = new URL(sourceUrl).hostname.toLowerCase().replace(/^www\./, '');
+  if (host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com')) return 'youtube';
+  if (host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'fb.watch') return 'facebook';
+  if (host === 'instagram.com' || host.endsWith('.instagram.com')) return 'instagram';
+  if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) return 'tiktok';
+  return 'other';
+}
+
+function cookieFileForPlatform(platform) {
+  if (platform === 'youtube' && YOUTUBE_COOKIES_FILE) return YOUTUBE_COOKIES_FILE;
+  if ((platform === 'facebook' || platform === 'instagram') && FACEBOOK_COOKIES_FILE) return FACEBOOK_COOKIES_FILE;
+  return YTDLP_COOKIES_FILE;
+}
+
+function proxyForPlatform(platform) {
+  // YTDLP_PROXY is intentionally YouTube-only. An expired YouTube proxy must
+  // never prevent Facebook/Instagram/TikTok links from being resolved directly.
+  if (platform === 'youtube') return YTDLP_PROXY;
+  if (platform === 'facebook' || platform === 'instagram') return META_PROXY;
+  return '';
+}
+
+function ytdlpProcessEnv(sourceUrl, proxyOverride) {
+  const platform = extractorPlatform(sourceUrl);
+  const platformProxy = proxyOverride === undefined ? proxyForPlatform(platform) : proxyOverride;
+  if (platform !== 'youtube' || !platformProxy) return process.env;
+
+  // Provider 1.3.1 forwards environment variables to its JavaScript runtime.
+  // Give the PO generator the same outbound proxy as yt-dlp so the token,
+  // manifest and signed Googlevideo URL all originate from one exit IP.
+  return withOutboundProxyEnv({ ...process.env }, platformProxy);
+}
+
+function liveStatusFromInfo(info) {
+  const status = String(info?.live_status || '').trim().toLowerCase();
+  const isLive = info?.is_live === true || status === 'is_live' || status === 'live';
+  return { isLive, liveStatus: status || (isLive ? 'is_live' : 'not_live') };
+}
+
+function ytdlpJsonArgs(sourceUrl, options = {}) {
+  // yt-dlp 2026 YouTube extraction needs an external JS runtime/EJS challenge solver.
+  // The Gateway image uses Node 22 and yt-dlp[default,curl-cffi]; explicitly enable Node
+  // so extraction is not silently degraded when YouTube changes its JS challenges.
+  const platform = extractorPlatform(sourceUrl);
+  const useCookies = options.useCookies !== false;
+  const usePoProvider = options.usePoProvider !== false;
+  const platformProxy = options.proxyUrl === undefined ? proxyForPlatform(platform) : options.proxyUrl;
+  const youtubePlayerClients = options.youtubePlayerClients === undefined
+    ? EFFECTIVE_YOUTUBE_PLAYER_CLIENTS
+    : String(options.youtubePlayerClients || '').trim();
+  const args = [
+    '--no-playlist', '--no-progress',
+    '--js-runtimes', 'node',
+    '--socket-timeout', '20', '--retries', '3', '--fragment-retries', '3', '--extractor-retries', '3',
+    '--skip-download', '--dump-single-json',
+    '-f', 'bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc1]+ba/best[vcodec^=avc1]/bv*+ba/best'
+  ];
+
+  const cookieFile = useCookies ? cookieFileForPlatform(platform) : '';
+  if (cookieFile) args.push('--cookies', cookieFile);
+  if (platformProxy) args.push('--proxy', platformProxy);
+
+  // curl_cffi is installed so extractors that need browser impersonation (notably Meta sites)
+  // can use it. Do not force impersonation globally because some sites work worse when forced.
+  if (YTDLP_IMPERSONATE) args.push('--impersonate', YTDLP_IMPERSONATE);
+  else if (platform === 'facebook' || platform === 'instagram') args.push('--impersonate', 'chrome');
+
+  if (platform === 'youtube') {
+    // Slow consecutive YouTube metadata requests slightly. yt-dlp documents
+    // request pacing as the primary protection against guest/account rate limits.
+    args.push('--sleep-requests', '0.8');
+    // mweb + a GVS PO Token restores live/DASH formats that YouTube may hide
+    // from datacenter IPs. The configured list remains an escape hatch, but
+    // mweb is automatically prepended whenever the provider is installed.
+    if (youtubePlayerClients) {
+      args.push('--extractor-args', `youtube:player_client=${youtubePlayerClients}`);
+    }
+    if (YOUTUBE_PO_PROVIDER_AVAILABLE && usePoProvider) {
+      args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=http://127.0.0.1:${YOUTUBE_PO_PROVIDER_PORT}`);
+      args.push('--extractor-args', `youtubepot-bgutilscript:server_home=${YOUTUBE_PO_PROVIDER_HOME}`);
+    }
   }
-  if (p.kind === 'upload' && session.loop) args.push('-stream_loop', '-1');
-  if (p.inputHeaders) args.push('-headers', p.inputHeaders);
-  args.push('-re', '-i', p.input);
 
-  if (!p.hasAudio) {
-    args.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
-  }
-  args.push('-map', '0:v:0');
-  args.push('-map', p.hasAudio ? '0:a:0?' : '1:a:0');
-
-  if (p.copyVideo) {
-    args.push('-c:v', 'copy');
-  } else {
-    // FFmpeg autorotate is enabled by default. Evenize after rotation without forcing 720/1080.
-    args.push('-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-b:v', '3500k', '-maxrate', '4500k', '-bufsize', '7000k',
-      '-g', '60', '-keyint_min', '60');
-  }
-
-  if (p.copyAudio) args.push('-c:a', 'copy');
-  else args.push('-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2');
-
-  args.push('-flvflags', 'no_duration_filesize', '-f', 'flv', session.rtmpUrl);
+  args.push(sourceUrl);
   return args;
 }
 
-function markMediaProgress(session) {
-  session.lastProgressAt = Date.now();
-  session.state = 'RUNNING';
-  session.error = '';
-  // Only consecutive failures are capped. A recovered live can reconnect again later.
-  session.consecutiveFailures = 0;
-  session.updatedAt = new Date().toISOString();
-}
-
-function positiveTime(value) {
-  if (!value || value === 'N/A') return false;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric)) return numeric > 0;
-  const match = /^(\d+):(\d+):(\d+(?:\.\d+)?)$/.exec(value);
-  if (!match) return false;
-  return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]) > 0;
-}
-
-function parseProgressLine(session, rawLine) {
-  const line = String(rawLine || '').trim();
-  if (!line) return;
-  let hasMediaProgress = false;
-  const pair = /^([a-z_]+)=(.*)$/.exec(line);
-  if (pair) {
-    const key = pair[1];
-    const value = pair[2].trim();
-    if (key === 'frame') {
-      const frame = Number(value);
-      if (Number.isFinite(frame)) session.frame = Math.max(0, frame);
-      hasMediaProgress = frame > 0;
-    } else if (key === 'bitrate') {
-      session.bitrate = value;
-    } else if (key === 'speed') {
-      session.speed = value;
-    } else if (key === 'total_size') {
-      const bytes = Number(value);
-      if (Number.isFinite(bytes)) session.outputBytes = Math.max(0, bytes);
-      hasMediaProgress = bytes > 0;
-    } else if (key === 'out_time_us' || key === 'out_time_ms' || key === 'out_time') {
-      hasMediaProgress = positiveTime(value);
-    }
-  } else {
-    // Backward-compatible parsing for FFmpeg builds that still emit human stats.
-    const frame = /frame=\s*(\d+)/.exec(line);
-    const bitrate = /bitrate=\s*([^\s]+)/.exec(line);
-    const speed = /speed=\s*([^\s]+)/.exec(line);
-    const size = /size=\s*(\d+)kB/.exec(line);
-    const time = /time=\s*([^\s]+)/.exec(line);
-    if (frame) session.frame = Number(frame[1]);
-    if (bitrate) session.bitrate = bitrate[1];
-    if (speed) session.speed = speed[1];
-    hasMediaProgress = Number(frame?.[1] || 0) > 0 || Number(size?.[1] || 0) > 0 || positiveTime(time?.[1]);
-  }
-  if (hasMediaProgress) markMediaProgress(session);
-}
-
-function parseProgress(session, text) {
-  const combined = `${session.progressBuffer || ''}${String(text || '')}`;
-  const lines = combined.split(/\r\n|\n|\r/);
-  session.progressBuffer = lines.pop() || '';
-  for (const line of lines) parseProgressLine(session, line);
-  // Do not let a malformed/no-newline stderr line grow without bound.
-  if (session.progressBuffer.length > 16_384) {
-    parseProgressLine(session, session.progressBuffer);
-    session.progressBuffer = '';
-  }
-}
-
-function scheduleSessionCleanup(session) {
-  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
-  session.cleanupTimer = setTimeout(() => {
-    if (sessions.get(session.id) === session && !session.shouldRun && !session.process) {
-      sessions.delete(session.id);
-    }
-  }, SESSION_RETENTION_MS);
-  session.cleanupTimer.unref?.();
-}
-
-function markTerminal(session, state, error = '') {
-  session.shouldRun = false;
-  session.state = state;
-  session.error = error;
-  session.updatedAt = new Date().toISOString();
-  cleanupSessionUpload(session);
-  scheduleSessionCleanup(session);
-}
-
-function scheduleRestart(session, reason, cleanExit = false) {
-  if (!session.shouldRun) return;
-  if (session.restartTimer) {
-    clearTimeout(session.restartTimer);
-    session.restartTimer = null;
-  }
-  if (cleanExit) {
-    if (!session.loop) {
-      markTerminal(session, 'STOPPED');
-      return;
-    }
-    // A normal end-of-video is a loop, not a transport failure. It must not consume
-    // the six consecutive reconnect attempts, otherwise a short clip would stop after six loops.
-    session.loopCount = (session.loopCount || 0) + 1;
-    session.state = 'RECONNECTING';
-    session.error = '';
-    session.updatedAt = new Date().toISOString();
-    session.restartTimer = setTimeout(() => {
-      session.restartTimer = null;
-      if (session.shouldRun) startFfmpeg(session).catch(err => scheduleRestart(session, err.message, false));
-    }, 700);
-    session.restartTimer.unref?.();
-    return;
-  }
-
-  session.restartCount += 1;
-  session.consecutiveFailures = (session.consecutiveFailures || 0) + 1;
-  if (session.consecutiveFailures > MAX_RESTARTS) {
-    markTerminal(session, 'FAILED', reason || 'FFmpeg dừng quá số lần reconnect liên tiếp');
-    return;
-  }
-  session.state = 'RECONNECTING';
-  session.error = reason || '';
-  session.updatedAt = new Date().toISOString();
-  const delayMs = Math.min(1500 * session.consecutiveFailures, 8000);
-  session.restartTimer = setTimeout(() => {
-    session.restartTimer = null;
-    if (session.shouldRun) startFfmpeg(session).catch(err => scheduleRestart(session, err.message, false));
-  }, delayMs);
-  session.restartTimer.unref?.();
-}
-
-function redactSensitive(value, session) {
-  let text = String(value || '');
-  if (session?.rtmpUrl) text = text.split(session.rtmpUrl).join('[RTMP_REDACTED]');
-  if (SMART_LINK_KEY) text = text.split(SMART_LINK_KEY).join('[KEY_REDACTED]');
-  return text;
-}
-
-async function startFfmpeg(session) {
-  if (!session.shouldRun) return;
-  if (session.process && session.process.exitCode === null) return;
-  session.state = (session.restartCount || session.loopCount) ? 'RECONNECTING' : 'STARTING';
-  session.progressBuffer = '';
-  session.forcedReason = '';
-  session.updatedAt = new Date().toISOString();
-  const args = buildFfmpegArgs(session);
-  const ff = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-  session.process = ff;
-  let tail = '';
-  let settled = false;
-  const finishAttempt = (code, signal, spawnError = null) => {
-    if (settled) return;
-    settled = true;
-    if (session.killTimer) {
-      clearTimeout(session.killTimer);
-      session.killTimer = null;
-    }
-    if (session.process === ff) session.process = null;
-    if (!session.shouldRun) {
-      markTerminal(session, 'STOPPED');
-      return;
-    }
-    const clean = !spawnError && code === 0;
-    const safeTail = redactSensitive(tail.replace(/\s+/g, ' ').slice(-800), session);
-    const reason = session.forcedReason || (spawnError
-      ? spawnError.message
-      : clean ? 'Nguồn đã kết thúc' : `FFmpeg exit=${code ?? 'null'} signal=${signal ?? '-'} • ${safeTail}`);
-    session.forcedReason = '';
-    scheduleRestart(session, reason, clean);
-  };
-  ff.stderr.setEncoding('utf8');
-  ff.stderr.on('data', chunk => {
-    tail = (tail + chunk).slice(-5000);
-    parseProgress(session, chunk);
-  });
-  ff.on('error', err => finishAttempt(null, null, err));
-  ff.on('exit', (code, signal) => finishAttempt(code, signal));
-}
-
-async function createSession(body) {
-  const rtmpUrl = String(body.rtmpUrl || '').trim();
-  if (!/^rtmps?:\/\//i.test(rtmpUrl)) throw new Error('rtmpUrl không hợp lệ');
-  const sourceType = String(body.sourceType || '').trim();
-  const sourceUrl = String(body.sourceUrl || '').trim();
-  const uploadId = String(body.uploadId || '').trim();
-  if (activeSessionCount() + pendingSessionCreates >= MAX_SESSIONS) {
-    throw new Error(`Worker đã đủ ${MAX_SESSIONS} phiên Online`);
-  }
-  pendingSessionCreates += 1;
-  let plan;
-  try {
-    plan = await inputPlan(sourceType, sourceUrl, uploadId);
-  } finally {
-    pendingSessionCreates -= 1;
-  }
-  const id = randomId('live');
-  const session = {
-    id,
-    sourceType,
-    sourceLabel: plan.sourceLabel,
-    plan,
-    rtmpUrl,
-    loop: body.loop !== false,
-    shouldRun: true,
-    state: 'STARTING',
-    bitrate: '', speed: '', frame: 0, outputBytes: 0, lastProgressAt: 0,
-    restartCount: 0, consecutiveFailures: 0, loopCount: 0,
-    error: '', process: null, progressBuffer: '', restartTimer: null, killTimer: null, cleanupTimer: null,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-  sessions.set(id, session);
-  await startFfmpeg(session);
-  return session;
-}
-
-
-function cleanupSessionUpload(session) {
-  if (session?.sourceType !== 'upload') return;
-  const file = session?.plan?.input;
-  if (file && String(file).startsWith(UPLOAD_DIR + path.sep)) {
-    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
-  }
-  for (const [id, meta] of uploads.entries()) {
-    if (meta?.path === file) uploads.delete(id);
-  }
-}
-
-function stopSession(session) {
-  session.shouldRun = false;
-  session.state = 'STOPPING';
-  session.updatedAt = new Date().toISOString();
-  if (session.restartTimer) {
-    clearTimeout(session.restartTimer);
-    session.restartTimer = null;
-  }
-  const ff = session.process;
-  if (ff && ff.exitCode === null) {
-    try { ff.kill('SIGTERM'); } catch {}
-    session.killTimer = setTimeout(() => {
-      session.killTimer = null;
-      // ChildProcess.killed only means a signal was sent. It does not prove the
-      // process exited, so use the live process reference for the SIGKILL fallback.
-      if (session.process === ff && ff.exitCode === null) {
-        try { ff.kill('SIGKILL'); } catch {}
+function runYtDlpJson(sourceUrl, options = {}) {
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs))
+    ? Math.max(5000, Math.min(50_000, Number(options.timeoutMs)))
+    : 50_000;
+  return new Promise((resolve, reject) => {
+    execFile(
+      YTDLP,
+      ytdlpJsonArgs(sourceUrl, options),
+      {
+        timeout: timeoutMs,
+        maxBuffer: 16 * 1024 * 1024,
+        windowsHide: true,
+        env: ytdlpProcessEnv(sourceUrl, options.proxyUrl)
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const timedOut = error?.killed === true || error?.signal === 'SIGTERM' || error?.code === 'ETIMEDOUT';
+          if (timedOut) {
+            return reject(new Error(`YTDLP_TIMEOUT: yt-dlp không hoàn tất việc lấy livestream trong ${Math.round(timeoutMs / 1000)} giây`));
+          }
+          // Never return error.message here: Node includes the full command and
+          // would expose proxy credentials/cookie paths to the Android UI.
+          const safeStderr = sanitizeSensitiveText(stderr).trim();
+          const detail = safeStderr
+            ? safeStderr.slice(-2200)
+            : `yt-dlp failed (exit=${String(error?.code ?? 'unknown').slice(0, 60)})`;
+          return reject(new Error(detail || 'yt-dlp failed'));
+        }
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (e) {
+          reject(new Error(`yt-dlp trả dữ liệu không hợp lệ: ${e.message}`));
+        }
       }
-    }, 5000);
-    session.killTimer.unref?.();
-  } else {
-    markTerminal(session, 'STOPPED');
+    );
+  });
+}
+
+function youtubeRateLimited(message) {
+  return /(?:http error\s*429|\b429\b[^\n]*too many requests|too many requests)/i.test(String(message || ''));
+}
+
+function waitMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function runMediaExtractor(sourceUrl) {
+  const platform = extractorPlatform(sourceUrl);
+  const configuredProxy = proxyForPlatform(platform);
+  try {
+    const info = await runYtDlpJson(sourceUrl, { proxyUrl: configuredProxy });
+    return { info, proxyUrl: configuredProxy, extractionRoute: configuredProxy ? 'configured-proxy' : 'direct' };
+  } catch (primaryError) {
+    // A PO token does not cure HTTP 429. For a public/unlisted live stream,
+    // make one controlled fallback through Render's direct IP using the HLS
+    // client, without account cookies or the PO provider. The returned media
+    // URL must then also be consumed directly, hence proxyUrl: ''.
+    if (platform !== 'youtube' || !configuredProxy || !youtubeRateLimited(primaryError?.message)) throw primaryError;
+
+    console.warn('[youtube 429] configured proxy was rate-limited; trying one direct web_safari HLS fallback');
+    await waitMs(1500);
+    try {
+      const info = await runYtDlpJson(sourceUrl, {
+        proxyUrl: '',
+        useCookies: false,
+        usePoProvider: false,
+        youtubePlayerClients: 'web_safari',
+        timeoutMs: 30_000
+      });
+      return { info, proxyUrl: '', extractionRoute: 'direct-public-live-fallback' };
+    } catch (fallbackError) {
+      const primary = sanitizeSensitiveText(primaryError?.message).slice(-1400);
+      const fallback = sanitizeSensitiveText(fallbackError?.message).slice(-700);
+      throw new Error(`${primary}\nDIRECT_HLS_FALLBACK_FAILED: ${fallback}`);
+    }
   }
 }
 
-function uploadFile(req, res, uploadId) {
-  const id = safeId(uploadId);
-  if (!id) return json(res, 400, { ok: false, error: 'uploadId không hợp lệ' });
-  const declared = Number(req.headers['content-length'] || 0);
-  if (declared > MAX_UPLOAD_BYTES) return json(res, 413, { ok: false, error: 'Video vượt giới hạn upload worker' });
-  const temp = path.join(UPLOAD_DIR, `${id}.part`);
-  const finalPath = path.join(UPLOAD_DIR, id);
-  const out = fs.createWriteStream(temp, { flags: 'w', mode: 0o600 });
-  let bytes = 0;
-  let failed = false;
-  req.on('data', chunk => {
-    bytes += chunk.length;
-    if (bytes > MAX_UPLOAD_BYTES && !failed) {
-      failed = true;
-      req.destroy(new Error('upload quá lớn'));
-      out.destroy();
-    }
-  });
-  req.pipe(out);
-  out.on('finish', () => {
-    if (failed) return;
-    fs.renameSync(temp, finalPath);
-    const filename = String(req.headers['x-shoplive-filename'] || 'video').replace(/[\r\n]/g, ' ').slice(0, 180);
-    uploads.set(id, { id, path: finalPath, bytes, filename, createdAt: Date.now() });
-    json(res, 201, { ok: true, uploadId: id, bytes, filename });
-  });
-  const fail = err => {
-    if (failed) return;
-    failed = true;
-    try { out.destroy(); } catch {}
-    try { if (fs.existsSync(temp)) fs.unlinkSync(temp); } catch {}
-    if (!res.headersSent) json(res, 500, { ok: false, error: err?.message || 'Upload lỗi' });
+function safeHttpHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return {};
+  const blocked = new Set(['host', 'content-length', 'connection', 'accept-encoding']);
+  const clean = {};
+  for (const [rawKey, rawValue] of Object.entries(headers)) {
+    const key = String(rawKey || '').trim();
+    const value = String(rawValue ?? '').replace(/[\r\n]+/g, ' ').trim();
+    if (!key || !value || blocked.has(key.toLowerCase())) continue;
+    if (!/^[A-Za-z0-9-]+$/.test(key)) continue;
+    clean[key] = value.slice(0, 2000);
+  }
+  return clean;
+}
+
+function formatToInput(format, fallbackHeaders = {}) {
+  const url = String(format?.url || '').trim();
+  if (!/^https?:\/\//i.test(url)) return null;
+  return {
+    url,
+    headers: safeHttpHeaders({ ...fallbackHeaders, ...(format?.http_headers || {}) }),
+    vcodec: String(format?.vcodec || ''),
+    acodec: String(format?.acodec || ''),
+    formatId: String(format?.format_id || ''),
+    width: positiveInt(format?.width),
+    height: positiveInt(format?.height),
+    fps: Number(format?.fps) || 0,
+    tbr: Number(format?.tbr) || 0
   };
-  req.on('error', fail);
-  out.on('error', fail);
+}
+
+function positiveInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function ratioNumber(value) {
+  const text = String(value || '').trim();
+  if (!text || text === 'N/A' || text === '0:1') return 0;
+  const parts = text.split(/[:/]/).map(Number);
+  if (parts.length === 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1]) && parts[1] !== 0) {
+    return parts[0] / parts[1];
+  }
+  const n = Number(text);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function normalizeRotation(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return ((Math.round(n) % 360) + 360) % 360;
+}
+
+function evenNative(value) {
+  const n = Math.max(2, Math.round(Number(value) || 0));
+  return n % 2 === 0 ? n : n + 1;
+}
+
+function ffmpegHttpProxyArgs(url, proxyUrl = '') {
+  const normalizedProxy = String(proxyUrl || '').trim();
+  const normalizedUrl = String(url || '').trim();
+  if (!normalizedProxy || !/^https?:\/\//i.test(normalizedUrl)) return [];
+  return ['-http_proxy', normalizedProxy];
+}
+
+function runFfprobeGeometry(input, proxyUrl = '') {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height,sample_aspect_ratio,display_aspect_ratio:stream_tags=rotate:stream_side_data=rotation',
+      '-of', 'json'
+    ];
+    // yt-dlp may return a CDN URL bound to the proxy exit IP. FFprobe must use
+    // the same proxy or geometry probing can intermittently fall back after 403.
+    args.push(...ffmpegHttpProxyArgs(input?.url, proxyUrl));
+    const headerValue = ffmpegHeaderValue(input?.headers || {});
+    if (headerValue) args.push('-headers', headerValue);
+    args.push(input.url);
+    execFile(
+      FFPROBE,
+      args,
+      { timeout: 25_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) return reject(new Error(String(stderr || error.message || 'ffprobe failed').trim().slice(-1600)));
+        try {
+          const json = JSON.parse(stdout || '{}');
+          const stream = Array.isArray(json.streams) ? json.streams[0] : null;
+          if (!stream) throw new Error('ffprobe không tìm thấy video stream');
+          const rawWidth = positiveInt(stream.width);
+          const rawHeight = positiveInt(stream.height);
+          if (!rawWidth || !rawHeight) throw new Error('ffprobe không đọc được width/height');
+          const sarText = String(stream.sample_aspect_ratio || '1:1');
+          const darText = String(stream.display_aspect_ratio || '');
+          const sar = ratioNumber(sarText) || 1;
+          const dar = ratioNumber(darText) || ((rawWidth * sar) / rawHeight);
+          let rotation = normalizeRotation(stream?.tags?.rotate);
+          if (Array.isArray(stream.side_data_list)) {
+            const side = stream.side_data_list.find(item => Number.isFinite(Number(item?.rotation)));
+            if (side) rotation = normalizeRotation(side.rotation);
+          }
+
+          // Convert non-square pixels to a square-pixel display frame without cropping.
+          // For the normal Facebook case SAR=1:1 this is exactly rawWidth x rawHeight.
+          let displayWidth = rawWidth;
+          let displayHeight = rawHeight;
+          if (Math.abs(sar - 1) > 0.0001) displayWidth = Math.max(2, Math.round(rawHeight * dar));
+          if (rotation === 90 || rotation === 270) [displayWidth, displayHeight] = [displayHeight, displayWidth];
+
+          resolve({
+            rawWidth,
+            rawHeight,
+            displayWidth: evenNative(displayWidth),
+            displayHeight: evenNative(displayHeight),
+            sar: sarText || '1:1',
+            dar: darText || `${displayWidth}:${displayHeight}`,
+            rotation
+          });
+        } catch (e) {
+          reject(new Error(`ffprobe JSON không hợp lệ: ${e.message}`));
+        }
+      }
+    );
+  });
+}
+
+async function enrichResolvedGeometry(resolved) {
+  const videoInput = resolved.inputs?.[resolved.videoIndex ?? 0];
+  if (!videoInput) return {
+    ...resolved,
+    rawWidth: resolved.sourceWidth,
+    rawHeight: resolved.sourceHeight,
+    displayWidth: evenNative(resolved.sourceWidth),
+    displayHeight: evenNative(resolved.sourceHeight),
+    sar: '1:1',
+    dar: resolved.sourceWidth && resolved.sourceHeight ? `${resolved.sourceWidth}:${resolved.sourceHeight}` : 'unknown',
+    geometrySource: 'yt-dlp-fallback'
+  };
+  try {
+    const geometry = await runFfprobeGeometry(videoInput, resolved.proxyUrl);
+    return { ...resolved, ...geometry, sourceWidth: geometry.displayWidth, sourceHeight: geometry.displayHeight, geometrySource: 'ffprobe' };
+  } catch (e) {
+    console.warn('[smart-link ffprobe fallback]', e.message);
+    const fallbackW = evenNative(resolved.sourceWidth || 720);
+    const fallbackH = evenNative(resolved.sourceHeight || 1280);
+    return {
+      ...resolved,
+      rawWidth: resolved.sourceWidth || fallbackW,
+      rawHeight: resolved.sourceHeight || fallbackH,
+      displayWidth: fallbackW,
+      displayHeight: fallbackH,
+      sar: '1:1',
+      dar: `${fallbackW}:${fallbackH}`,
+      geometrySource: 'yt-dlp-fallback'
+    };
+  }
+}
+
+function nativeOutputSize(resolved) {
+  return {
+    width: evenNative(resolved.displayWidth || resolved.sourceWidth),
+    height: evenNative(resolved.displayHeight || resolved.sourceHeight)
+  };
+}
+
+function fitWithin1080p(width, height) {
+  const sourceWidth = positiveInt(width);
+  const sourceHeight = positiveInt(height);
+  if (!sourceWidth || !sourceHeight) return { width: 720, height: 1280, capped: false };
+
+  const longEdge = Math.max(sourceWidth, sourceHeight);
+  const shortEdge = Math.min(sourceWidth, sourceHeight);
+  const scale = Math.min(
+    1,
+    SMART_LINK_MAX_LONG_EDGE / longEdge,
+    SMART_LINK_MAX_SHORT_EDGE / shortEdge
+  );
+  const evenDown = value => Math.max(2, Math.floor(value / 2) * 2);
+  return {
+    width: evenDown(sourceWidth * scale),
+    height: evenDown(sourceHeight * scale),
+    capped: scale < 0.9999
+  };
+}
+
+function cappedOutputSize(resolved) {
+  const native = nativeOutputSize(resolved);
+  return fitWithin1080p(native.width, native.height);
+}
+
+function formatHasVideo(format) {
+  return Boolean(format && format.vcodec && format.vcodec !== 'none');
+}
+
+function formatHasAudio(format) {
+  return Boolean(format && format.acodec && format.acodec !== 'none');
+}
+
+function formatFits1080p(format) {
+  const width = positiveInt(format?.width);
+  const height = positiveInt(format?.height);
+  if (!width || !height) return false;
+  return Math.max(width, height) <= SMART_LINK_MAX_LONG_EDGE
+    && Math.min(width, height) <= SMART_LINK_MAX_SHORT_EDGE;
+}
+
+function formatArea(format) {
+  return positiveInt(format?.width) * positiveInt(format?.height);
+}
+
+function formatBitrate(format) {
+  return Number(format?.tbr) || (Number(format?.vbr) + Number(format?.abr)) || Number(format?.vbr) || 0;
+}
+
+function compareVideoFormats(a, b) {
+  // H.264 can be remuxed directly to HTTP-FLV. Prefer it before another codec
+  // that would force a costly Render transcode, then keep the clearest <=1080p rendition.
+  const h264 = Number(codecIsH264(b?.vcodec)) - Number(codecIsH264(a?.vcodec));
+  if (h264) return h264;
+  const area = formatArea(b) - formatArea(a);
+  if (area) return area;
+  // For equal resolution prefer normal 30 fps, reducing source bandwidth and jitter.
+  const aFpsPenalty = (Number(a?.fps) || 0) > 30.5 ? 1 : 0;
+  const bFpsPenalty = (Number(b?.fps) || 0) > 30.5 ? 1 : 0;
+  if (aFpsPenalty !== bFpsPenalty) return aFpsPenalty - bFpsPenalty;
+  return formatBitrate(b) - formatBitrate(a);
+}
+
+function compareAudioFormats(a, b) {
+  const aac = Number(codecIsAac(b?.acodec)) - Number(codecIsAac(a?.acodec));
+  if (aac) return aac;
+  const audioOnly = Number(!formatHasVideo(b)) - Number(!formatHasVideo(a));
+  if (audioOnly) return audioOnly;
+  // If Meta exposes no audio-only URL, use the smallest combined rendition as
+  // the audio input so a 4K video track is not downloaded merely to get audio.
+  if (formatHasVideo(a) && formatHasVideo(b)) {
+    const area = formatArea(a) - formatArea(b);
+    if (area) return area;
+  }
+  return (Number(b?.abr) || Number(b?.tbr) || 0) - (Number(a?.abr) || Number(a?.tbr) || 0);
+}
+
+function pick1080pFormats(info) {
+  const formats = Array.isArray(info?.formats) ? info.formats : [];
+  const videoCandidates = formats
+    .filter(format => formatHasVideo(format) && /^https?:\/\//i.test(String(format?.url || '')) && formatFits1080p(format))
+    .sort(compareVideoFormats);
+  const video = videoCandidates[0] || null;
+  if (!video) return null;
+
+  // A combined H.264/AAC rendition is ideal for Facebook and live HLS: one
+  // connection, matching timestamps, and no unnecessary audio download.
+  if (formatHasAudio(video) && codecIsAac(video.acodec)) return { video, audio: video };
+
+  const audioCandidates = formats
+    .filter(format => formatHasAudio(format) && /^https?:\/\//i.test(String(format?.url || '')))
+    .sort(compareAudioFormats);
+  return { video, audio: audioCandidates[0] || null };
+}
+
+function resolvedGeometry(info, videoFmt = null) {
+  let width = positiveInt(videoFmt?.width) || positiveInt(info?.width);
+  let height = positiveInt(videoFmt?.height) || positiveInt(info?.height);
+  const rotation = ((positiveInt(videoFmt?.rotation) || positiveInt(info?.rotation)) % 360 + 360) % 360;
+  if ((!width || !height) && Array.isArray(info?.formats)) {
+    const candidates = info.formats
+      .filter(f => f && f.vcodec && f.vcodec !== 'none' && positiveInt(f.width) && positiveInt(f.height))
+      .sort((a, b) => (positiveInt(b.width) * positiveInt(b.height)) - (positiveInt(a.width) * positiveInt(a.height)));
+    if (candidates.length) {
+      width = positiveInt(candidates[0].width);
+      height = positiveInt(candidates[0].height);
+    }
+  }
+  if (rotation === 90 || rotation === 270) [width, height] = [height, width];
+  return { sourceWidth: width, sourceHeight: height, rotation };
+}
+
+function pickResolvedInputs(info) {
+  const baseHeaders = safeHttpHeaders(info?.http_headers || {});
+  const requested = Array.isArray(info?.requested_formats) ? info.requested_formats : [];
+
+  // Ignore a 2K/4K requested rendition when yt-dlp also exposes a <=1080p
+  // rendition. This reduces proxy/CDN traffic before FFmpeg, instead of first
+  // downloading 4K and only then scaling it down on Render.
+  const cappedFormats = pick1080pFormats(info);
+  if (cappedFormats) {
+    const video = formatToInput(cappedFormats.video, baseHeaders);
+    const audio = formatToInput(cappedFormats.audio, baseHeaders);
+    if (!video) throw new Error('yt-dlp không trả URL video 1080p có thể phát');
+    const geometry = resolvedGeometry(info, cappedFormats.video);
+    if (audio && audio.url !== video.url) return { inputs: [video, audio], videoIndex: 0, audioIndex: 1, ...geometry };
+    return { inputs: [video], videoIndex: 0, audioIndex: audio ? 0 : null, ...geometry };
+  }
+
+  if (requested.length) {
+    const videoFmt = requested.find(f => f && f.vcodec && f.vcodec !== 'none') || null;
+    const audioFmt = requested.find(f => f && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+      || requested.find(f => f && f.acodec && f.acodec !== 'none') || null;
+    const video = formatToInput(videoFmt, baseHeaders);
+    const audio = formatToInput(audioFmt, baseHeaders);
+    if (!video) throw new Error('yt-dlp không trả URL video có thể phát');
+    const geometry = resolvedGeometry(info, videoFmt);
+    if (audio && audio.url !== video.url) return { inputs: [video, audio], videoIndex: 0, audioIndex: 1, ...geometry };
+    return { inputs: [video], videoIndex: 0, audioIndex: audio ? 0 : null, ...geometry };
+  }
+
+  const combined = formatToInput(info, baseHeaders);
+  if (!combined) throw new Error('yt-dlp không trả URL media có thể phát');
+  const hasAudio = info?.acodec && info.acodec !== 'none';
+  return { inputs: [combined], videoIndex: 0, audioIndex: hasAudio ? 0 : null, ...resolvedGeometry(info, info) };
+}
+
+async function resolvePageMedia(sourceUrl) {
+  const now = Date.now();
+  const cached = sourceResolveCache.get(sourceUrl);
+  if (cached && cached.expiresAt > now) return cached.promise;
+
+  const platform = extractorPlatform(sourceUrl);
+  const promise = runMediaExtractor(sourceUrl)
+    .then(({ info, proxyUrl, extractionRoute }) => ({
+      ...pickResolvedInputs(info),
+      platform,
+      proxyUrl,
+      extractionRoute,
+      ...liveStatusFromInfo(info)
+    }))
+    .then(resolved => enrichResolvedGeometry(resolved))
+    .catch(error => {
+      sourceResolveCache.delete(sourceUrl);
+      throw error;
+    });
+  // Short cache is enough to deduplicate the video/audio ExoPlayer requests without holding
+  // signed CDN URLs for too long.
+  sourceResolveCache.set(sourceUrl, { expiresAt: now + 90_000, promise });
+  return promise;
+}
+
+function ffmpegHeaderValue(headers) {
+  const entries = Object.entries(headers || {});
+  if (!entries.length) return '';
+  return entries.map(([key, value]) => `${key}: ${value}\r\n`).join('');
+}
+
+function ffmpegInputArgs(input, proxyUrl = '', isLive = false) {
+  const args = [];
+  // Do not use -re here. Android performs the final real-time pacing. Let the
+  // Gateway fill its playback buffer as quickly as the source allows so short
+  // CDN/proxy stalls do not immediately interrupt the outgoing Live.
+  args.push(
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-reconnect_on_network_error', '1', '-reconnect_on_http_error', '408,429,5xx',
+    '-rw_timeout', '30000000'
+  );
+  // Keep the media download on the same exit IP used by yt-dlp. Without this,
+  // signed Googlevideo URLs may send a short FLV header and then fail with 403.
+  args.push(...ffmpegHttpProxyArgs(input?.url, proxyUrl));
+  const headerValue = ffmpegHeaderValue(input.headers);
+  if (headerValue) args.push('-headers', headerValue);
+  args.push('-thread_queue_size', '4096', '-i', input.url);
+  return args;
+}
+
+function codecIsH264(value) {
+  return /^(avc1|h264|avc)/i.test(String(value || ''));
+}
+
+function codecIsAac(value) {
+  return /^(mp4a|aac)/i.test(String(value || ''));
+}
+
+function canNativeCopy(resolved, container, targetSize) {
+  if (container !== 'flv') return false;
+  const native = nativeOutputSize(resolved);
+  if (!targetSize || targetSize.width !== native.width || targetSize.height !== native.height) return false;
+  if ((resolved.rotation || 0) !== 0 || Math.abs((ratioNumber(resolved.sar) || 1) - 1) > 0.0001) return false;
+  const video = resolved.inputs?.[resolved.videoIndex ?? 0];
+  // Audio is deliberately normalized in ffmpegCopyTail. Only the video codec
+  // must be FLV-compatible for the low-CPU video-copy path.
+  return codecIsH264(video?.vcodec);
+}
+
+function ffmpegCopyTail(videoIndex = 0, audioIndex = 0) {
+  const args = ['-map', `${videoIndex}:v:0`];
+  if (audioIndex === null || audioIndex === undefined) args.push('-map', `${videoIndex}:a:0?`);
+  else args.push('-map', `${audioIndex}:a:0?`);
+  args.push(
+    '-fflags', '+genpts', '-avoid_negative_ts', 'make_zero',
+    '-c:v', 'copy',
+    // Never copy the source AAC configuration verbatim. Some YouTube/Meta
+    // renditions expose an empty or unusual AudioSpecificConfig that causes
+    // Media3's FLV reader to fail before reaching READY. Rebuilding only audio
+    // is cheap and guarantees the exact format expected by the Android app.
+    '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+    '-flvflags', 'no_duration_filesize', '-f', 'flv', 'pipe:1'
+  );
+  return args;
+}
+
+function ffmpegTranscodeTail(videoIndex = 0, audioIndex = 0, container = 'ts', targetSize = null) {
+  const args = [
+    '-map', `${videoIndex}:v:0`,
+  ];
+  if (audioIndex === null || audioIndex === undefined) args.push('-map', `${videoIndex}:a:0?`);
+  else args.push('-map', `${audioIndex}:a:0?`);
+  // Smart Link native-resolution policy: one source frame maps to one full encoder frame.
+  // No pad, no crop, no 720x1280 envelope. FFmpeg's normal autorotate runs first;
+  // scaling then normalizes the decoded display frame to the exact native canvas.
+  const scaleFilter = targetSize?.width && targetSize?.height
+    ? `scale=${targetSize.width}:${targetSize.height}:flags=lanczos,setsar=1`
+    : `scale=${RESOLUTION}:flags=lanczos,setsar=1`;
+  args.push(
+    '-fflags', '+genpts',
+    '-vf', scaleFilter,
+    '-r', '30',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+    '-pix_fmt', 'yuv420p', '-b:v', VIDEO_BITRATE, '-maxrate', VIDEO_BITRATE, '-bufsize', '5000k', '-g', '60',
+    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2'
+  );
+
+  // 2.7.0: prefer HTTP-FLV for Android Smart Link. FLV has a tiny fixed magic header,
+  // is naturally streamable over chunked HTTP, and carries H.264/AAC without the MP4 brand/init
+  // ambiguity seen on some proxies/devices. fMP4/TS stay available for older builds/debugging.
+  if (container === 'flv') {
+    args.push('-flvflags', 'no_duration_filesize', '-f', 'flv', 'pipe:1');
+  } else if (container === 'fmp4') {
+    args.push(
+      '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+      '-frag_duration', '1000000',
+      '-f', 'mp4', 'pipe:1'
+    );
+  } else {
+    args.push('-f', 'mpegts', 'pipe:1');
+  }
+  return args;
+}
+
+function ffmpegForDirect(sourceUrl, container = 'ts') {
+  return [
+    '-hide_banner', '-loglevel', 'warning', '-nostdin',
+    ...ffmpegInputArgs({ url: sourceUrl, headers: {} }),
+    ...ffmpegTranscodeTail(0, 0, container)
+  ];
+}
+
+function ffmpegForResolved(resolved, container = 'ts', targetSize = null) {
+  const args = ['-hide_banner', '-loglevel', 'warning', '-nostdin'];
+  for (const input of resolved.inputs) args.push(...ffmpegInputArgs(input, resolved.proxyUrl, resolved.isLive));
+  const nativeCopy = canNativeCopy(resolved, container, targetSize);
+  args.push(...(nativeCopy
+    ? ffmpegCopyTail(resolved.videoIndex, resolved.audioIndex)
+    : ffmpegTranscodeTail(resolved.videoIndex, resolved.audioIndex, container, targetSize)));
+  return { args, nativeCopy };
+}
+
+function looksLikeTs(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 188 * 3) return false;
+  // Allow a small prefix, but require three consecutive MPEG-TS sync bytes 188 bytes apart.
+  const maxOffset = Math.min(187, buffer.length - 188 * 3);
+  for (let offset = 0; offset <= maxOffset; offset++) {
+    if (buffer[offset] === 0x47 && buffer[offset + 188] === 0x47 && buffer[offset + 376] === 0x47) return true;
+  }
+  return false;
+}
+
+function looksLikeFlv(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 13) return false;
+  // Signature 'FLV', version 1, flags include audio/video, DataOffset >= 9.
+  if (buffer[0] !== 0x46 || buffer[1] !== 0x4c || buffer[2] !== 0x56) return false;
+  if (buffer[3] !== 0x01) return false;
+  const flags = buffer[4];
+  if ((flags & 0x05) === 0) return false;
+  const dataOffset = buffer.readUInt32BE(5);
+  return dataOffset >= 9 && dataOffset <= buffer.length;
+}
+
+function looksLikePlayableFlv(buffer) {
+  if (!looksLikeFlv(buffer)) return false;
+  const dataOffset = buffer.readUInt32BE(5);
+  let offset = dataOffset + 4; // Skip PreviousTagSize0.
+  while (offset + 15 <= buffer.length) {
+    const tagType = buffer[offset] & 0x1f;
+    const dataSize = (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3];
+    const dataStart = offset + 11;
+    const dataEnd = dataStart + dataSize;
+    if (dataEnd + 4 > buffer.length) break;
+    if (tagType === 9 && dataSize >= 2) {
+      const videoHeader = buffer[dataStart];
+      const codecId = videoHeader & 0x0f;
+      // H.264/AVC packet type 1 contains actual NAL units. Packet type 0 is
+      // only decoder configuration and is not enough to declare the stream ready.
+      if (codecId === 7 && buffer[dataStart + 1] === 1) return true;
+      if (codecId !== 0 && codecId !== 7) return true;
+    }
+    offset = dataEnd + 4;
+  }
+  return false;
+}
+
+function looksLikeFmp4(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  // A valid FFmpeg fragmented MP4 starts with an ISO-BMFF box such as ftyp, followed by moov.
+  // Search only the initialization prefix so random payload bytes cannot satisfy this check.
+  const head = buffer.subarray(0, Math.min(buffer.length, 64 * 1024));
+  let offset = 0;
+  let sawFtyp = false;
+  let sawMoov = false;
+  while (offset + 8 <= head.length) {
+    let size = head.readUInt32BE(offset);
+    const type = head.toString('ascii', offset + 4, offset + 8);
+    if (size === 1) {
+      if (offset + 16 > head.length) break;
+      const big = head.readBigUInt64BE(offset + 8);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) break;
+      size = Number(big);
+    } else if (size === 0) {
+      size = head.length - offset;
+    }
+    if (size < 8) break;
+    if (type === 'ftyp') sawFtyp = true;
+    if (type === 'moov') sawMoov = true;
+    if (sawFtyp && sawMoov) return true;
+    if (offset + size > head.length) break;
+    offset += size;
+  }
+  return sawFtyp && buffer.length >= 1024;
+}
+
+function probeFfmpegOutput(ff, container, timeoutMs = 25000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let stderrTail = '';
+    let settled = false;
+
+    const timer = setTimeout(() => fail(new Error(`FFmpeg không tạo dữ liệu ${container} sau ${Math.round(timeoutMs / 1000)} giây`)), timeoutMs);
+    const onStderr = chunk => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-5000);
+    };
+    const onError = err => fail(err);
+    const onClose = code => {
+      if (!settled) fail(new Error((stderrTail.trim() || `FFmpeg kết thúc sớm (code ${code})`).slice(-1800)));
+    };
+    const onData = chunk => {
+      if (settled) return;
+      chunks.push(chunk);
+      total += chunk.length;
+      if (total > 512 * 1024) {
+        const prefix = Buffer.concat(chunks, total);
+        return fail(new Error(`FFmpeg có dữ liệu nhưng không phải ${container}; prefix=${prefix.subarray(0, 24).toString('hex')}`));
+      }
+      if (total < 1024) return;
+      const prefix = Buffer.concat(chunks, total);
+      const valid = container === 'flv' ? looksLikePlayableFlv(prefix) : (container === 'fmp4' ? looksLikeFmp4(prefix) : looksLikeTs(prefix));
+      if (!valid) return;
+
+      settled = true;
+      clearTimeout(timer);
+      ff.stdout.pause();
+      ff.stdout.off('data', onData);
+      ff.stderr.off('data', onStderr);
+      ff.off('error', onError);
+      ff.off('close', onClose);
+      resolve({ prefix, stderrTail });
+    };
+
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ff.stdout.off('data', onData);
+      ff.stderr.off('data', onStderr);
+      ff.off('error', onError);
+      ff.off('close', onClose);
+      if (!ff.killed) ff.kill('SIGKILL');
+      const detail = stderrTail.trim();
+      reject(new Error(detail ? `${error.message} • ${detail.slice(-1600)}` : error.message));
+    }
+
+    ff.stderr.on('data', onStderr);
+    ff.on('error', onError);
+    ff.on('close', onClose);
+    ff.stdout.on('data', onData);
+  });
+}
+
+function smartLinkResolveError(sourceUrl, message) {
+  const platform = extractorPlatform(sourceUrl);
+  const lower = String(message || '').toLowerCase();
+  const authLike = /sign in|log in|login|cookies?|not a bot|confirm you(?:'|’)re not a bot|authentication|private video|members-only|age-restricted/.test(lower);
+  const rateLimited = youtubeRateLimited(lower);
+  const forbidden = /http error 403|forbidden/.test(lower);
+  const timedOut = /ytdlp_timeout|timed out|không hoàn tất[^\n]*50 giây/.test(lower);
+  const poTokenLike = /po token|proof[- ]of[- ]origin|gvs|missing[^\n]*token|token[^\n]*required|no video formats|requested format is not available|only images/.test(lower);
+  const notStarted = /live event will begin|not yet started|scheduled for|upcoming|premiere will begin/.test(lower);
+  const cookieFile = cookieFileForPlatform(platform);
+
+  if (platform === 'youtube' && timedOut) return {
+    code: 'YOUTUBE_EXTRACTOR_TIMEOUT', needsCookies: false, needsProxy: false,
+    hint: 'YouTube Live phản hồi quá chậm. Gateway đã chuyển sang PO HTTP provider; thử lại sau 5-10 giây. Nếu lặp lại, kiểm tra proxy còn tốc độ và còn hạn.'
+  };
+  if (platform === 'youtube' && notStarted) return {
+    code: 'YOUTUBE_LIVE_NOT_STARTED', needsCookies: false, needsProxy: false,
+    hint: 'Livestream này mới được lên lịch và chưa bắt đầu phát. Hãy thử lại khi YouTube đã hiện LIVE.'
+  };
+  // Check 429 before the generic "No video formats"/PO-token signature. yt-dlp
+  // reports the latter after an m3u8 request was rate-limited, but the first
+  // cause is the IP/session limit and generating another PO token cannot fix it.
+  if (platform === 'youtube' && rateLimited) return {
+    code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
+    hint: YTDLP_PROXY
+      ? 'YouTube trả HTTP 429 cho IP proxy hiện tại. Hãy bấm Đổi IP ở nhà cung cấp proxy hoặc thay YTDLP_PROXY; Gateway đã thử thêm đường HLS trực tiếp nhưng cả hai đều chưa lấy được luồng.'
+      : 'YouTube trả HTTP 429 cho IP máy chủ Render. Hãy chờ rồi thử lại hoặc cấu hình YTDLP_PROXY bằng proxy dân cư còn hoạt động.'
+  };
+  if (platform === 'youtube' && poTokenLike) return {
+    code: 'YOUTUBE_PO_TOKEN_FAILED', needsCookies: false, needsProxy: false,
+    hint: YOUTUBE_PO_PROVIDER_AVAILABLE
+      ? 'Gateway có PO Token provider nhưng YouTube chưa cấp manifest livestream. Thử lại sau 5-10 giây; nếu vẫn lỗi, kiểm tra proxy YouTube còn hoạt động.'
+      : 'Gateway hiện chưa có PO Token provider cho YouTube Live. Hãy deploy Gateway 2.8.4 trở lên.'
+  };
+
+  if (platform === 'youtube' && authLike) {
+    if (!cookieFile) return {
+      code: 'YOUTUBE_AUTH_REQUIRED', needsCookies: true, needsProxy: false,
+      hint: 'YouTube đang yêu cầu xác thực. Gateway 2.8.4 đã có JS/EJS và PO Token; hãy cấu hình YOUTUBE_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+    };
+    return {
+      code: 'YOUTUBE_IP_OR_SESSION_BLOCKED', needsCookies: false, needsProxy: true,
+      hint: 'Cookie YouTube đã được nạp nhưng YouTube vẫn chặn phiên/IP máy chủ Render. Hãy làm mới cookie; nếu vẫn lỗi, cấu hình YTDLP_PROXY bằng proxy hợp lệ.'
+    };
+  }
+  if (platform === 'youtube' && forbidden) return {
+    code: 'YOUTUBE_403', needsCookies: !cookieFile, needsProxy: Boolean(cookieFile),
+    hint: cookieFile
+      ? 'YouTube trả 403 dù đã có cookie; làm mới cookie hoặc dùng YTDLP_PROXY.'
+      : 'YouTube trả 403; cấu hình YOUTUBE_COOKIES_B64 trước.'
+  };
+  if ((platform === 'facebook' || platform === 'instagram') && authLike) return {
+    code: 'META_AUTH_REQUIRED', needsCookies: !cookieFile, needsProxy: false,
+    hint: cookieFile
+      ? 'Facebook/Instagram vẫn yêu cầu đăng nhập; hãy xuất lại cookie tài khoản có quyền xem video.'
+      : 'Facebook/Instagram yêu cầu đăng nhập. Cấu hình FACEBOOK_COOKIES_B64 (hoặc YTDLP_COOKIES_B64) trên Render.'
+  };
+  return {
+    code: 'EXTRACTOR_FAILED', needsCookies: false, needsProxy: false,
+    hint: 'Không tách được link. Kiểm tra video còn công khai, không DRM và xem Render logs để biết chi tiết.'
+  };
+}
+
+async function handleProbe(req, res, requestUrl) {
+  if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
+  const raw = requestUrl.searchParams.get('url');
+  if (!raw) return json(res, 400, { ok: false, error: 'missing url' });
+  let sourceUrl;
+  try { sourceUrl = await safePublicUrl(raw); }
+  catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+  const parsed = new URL(sourceUrl);
+  if (!supportedShareHost(parsed.hostname)) {
+    return json(res, 400, { ok: false, error: 'probe-v5 chỉ dùng cho link chia sẻ YouTube/Facebook/TikTok/Vimeo/Instagram' });
+  }
+  try {
+    const resolved = await resolvePageMedia(sourceUrl);
+    const native = nativeOutputSize(resolved);
+    const output = cappedOutputSize(resolved);
+    return json(res, 200, {
+      ok: true,
+      version: GATEWAY_VERSION,
+      rawWidth: resolved.rawWidth || resolved.sourceWidth,
+      rawHeight: resolved.rawHeight || resolved.sourceHeight,
+      sourceWidth: resolved.displayWidth || resolved.sourceWidth,
+      sourceHeight: resolved.displayHeight || resolved.sourceHeight,
+      displayWidth: output.width,
+      displayHeight: output.height,
+      sar: resolved.sar || '1:1',
+      dar: resolved.dar || `${native.width}:${native.height}`,
+      rotation: resolved.rotation || 0,
+      geometrySource: resolved.geometrySource || 'unknown',
+      encoderWidth: output.width,
+      encoderHeight: output.height,
+      nativeResolution: !output.capped,
+      resolutionCapped: output.capped,
+      maxResolution: '1080p',
+      isLive: Boolean(resolved.isLive),
+      liveStatus: resolved.liveStatus || 'not_live',
+      aspect: output.width / output.height
+    });
+  } catch (e) {
+    const message = String(e?.message || 'Không tách được link').slice(-1600);
+    const classified = smartLinkResolveError(sourceUrl, message);
+    return json(res, 502, {
+      ok: false, code: classified.code, error: message, gatewayVersion: GATEWAY_VERSION,
+      platform: extractorPlatform(sourceUrl), needsCookies: classified.needsCookies,
+      needsProxy: classified.needsProxy, hint: classified.hint
+    });
+  }
+}
+
+async function handleSource(req, res, requestUrl) {
+  if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
+  const raw = requestUrl.searchParams.get('url');
+  if (!raw) return json(res, 400, { ok: false, error: 'missing url' });
+
+  const requestedContainer = requestUrl.searchParams.get('container');
+  const container = requestedContainer === 'flv' ? 'flv' : (requestedContainer === 'fmp4' ? 'fmp4' : 'ts');
+
+  let sourceUrl;
+  try { sourceUrl = await safePublicUrl(raw); }
+  catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+
+  const parsed = new URL(sourceUrl);
+  const pageSource = supportedShareHost(parsed.hostname);
+  let ffArgs;
+  let outputSize = null;
+  let sourceIsLive = false;
+  if (pageSource) {
+    try {
+      const resolved = await resolvePageMedia(sourceUrl);
+      sourceIsLive = Boolean(resolved.isLive);
+      const requestedW = positiveInt(requestUrl.searchParams.get('w'));
+      const requestedH = positiveInt(requestUrl.searchParams.get('h'));
+      const native = nativeOutputSize(resolved);
+      const cappedNative = cappedOutputSize(resolved);
+      const requested = (requestedW >= 2 && requestedH >= 2 && requestedW <= 8192 && requestedH <= 8192)
+        ? fitWithin1080p(requestedW, requestedH)
+        : null;
+      const nativeAspect = native.width / native.height;
+      const requestedAspect = requested ? requested.width / requested.height : 0;
+      const requestedKeepsAspect = requested && Math.abs((requestedAspect / nativeAspect) - 1) <= 0.015;
+      outputSize = requestedKeepsAspect
+        ? { width: requested.width, height: requested.height }
+        : { width: cappedNative.width, height: cappedNative.height };
+      // Do not silently accept a caller canvas that differs from the probed native frame.
+      // Old clients may still send w/h, but v5 clients send exactly these native values.
+      if (requestedW > 0 && requestedH > 0 && (!requestedKeepsAspect || outputSize.width !== requestedW || outputSize.height !== requestedH)) {
+        console.warn(`[smart-link 1080p] requested ${requestedW}x${requestedH}, output ${outputSize.width}x${outputSize.height}, source ${native.width}x${native.height}`);
+      }
+      const ffBuild = ffmpegForResolved(resolved, container, outputSize);
+      ffArgs = ffBuild.args;
+      if (ffBuild.nativeCopy) console.log(`[smart-link video-copy] ${outputSize.width}x${outputSize.height} H.264 copy + normalized AAC-LC`);
+    } catch (e) {
+      const message = String(e?.message || 'Không tách được link').slice(-1600);
+      console.error('[smart-link resolve]', message);
+      const classified = smartLinkResolveError(sourceUrl, message);
+      return json(res, 502, {
+        ok: false,
+        code: classified.code,
+        error: message,
+        gatewayVersion: GATEWAY_VERSION,
+        platform: extractorPlatform(sourceUrl),
+        needsCookies: classified.needsCookies,
+        needsProxy: classified.needsProxy,
+        hint: classified.hint
+      });
+    }
+  } else {
+    ffArgs = ffmpegForDirect(sourceUrl, container);
+  }
+
+  const ff = spawn(FFMPEG, ffArgs, {
+    stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true
+  });
+
+  let closed = false;
+  const stop = () => {
+    if (closed) return;
+    closed = true;
+    if (!ff.killed) ff.kill('SIGKILL');
+  };
+  res.on('close', stop);
+  req.on('error', stop);
+
+  // 2.7.0: never return HTTP 200 until FFmpeg has emitted a valid container signature.
+  // Previously a failed FFmpeg process produced an empty HTTP 200 body, so Media3 reported
+  // ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED instead of the real yt-dlp/FFmpeg error.
+  let probe;
+  try {
+    probe = await probeFfmpegOutput(ff, container, sourceIsLive ? 45000 : 25000);
+  } catch (e) {
+    const message = String(e?.message || 'FFmpeg không tạo được media').slice(-2200);
+    console.error('[smart-link ffmpeg probe]', message);
+    if (pageSource) sourceResolveCache.delete(sourceUrl);
+    if (!res.destroyed && !res.headersSent) {
+      return json(res, 502, {
+        ok: false,
+        error: message,
+        gatewayVersion: GATEWAY_VERSION,
+        hint: 'Gateway không tạo được luồng H.264/AAC. Xem Render logs; nếu là YouTube/Facebook chống bot, cập nhật yt-dlp/cookies.'
+      });
+    }
+    return;
+  }
+
+  if (closed || res.destroyed) return stop();
+
+  res.writeHead(200, {
+    'content-type': container === 'flv' ? 'video/x-flv' : (container === 'fmp4' ? 'video/mp4' : 'video/mp2t'),
+    'cache-control': 'no-store, no-cache, must-revalidate',
+    'connection': 'keep-alive',
+    'x-shoplive-source': pageSource ? 'smart-link-resolved' : 'direct',
+    'x-shoplive-container': container,
+    'x-shoplive-gateway-version': GATEWAY_VERSION,
+    'x-shoplive-frame-policy': '1080p-max-no-pad-no-crop',
+    'x-shoplive-live': sourceIsLive ? 'true' : 'false',
+    ...(outputSize ? { 'x-shoplive-width': String(outputSize.width), 'x-shoplive-height': String(outputSize.height) } : {})
+  });
+  res.write(probe.prefix);
+
+  ff.stdout.pipe(res);
+  ff.stdout.resume();
+  ff.stderr.on('data', chunk => console.error('[ffmpeg]', chunk.toString().trim()));
+  ff.on('error', err => {
+    console.error('[ffmpeg error]', err.message);
+    if (pageSource) sourceResolveCache.delete(sourceUrl);
+    if (!res.headersSent) json(res, 500, { ok: false, error: 'ffmpeg unavailable', gatewayVersion: GATEWAY_VERSION });
+    else res.destroy(err);
+  });
+  ff.on('close', code => {
+    if (!closed && code !== 0) console.error(`ffmpeg exited ${code}`);
+    if (pageSource && (code !== 0 || sourceIsLive)) sourceResolveCache.delete(sourceUrl);
+    if (!res.writableEnded) res.end();
+    closed = true;
+  });
 }
 
 const server = http.createServer(async (req, res) => {
-  const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const pathname = requestUrl.pathname;
+  try {
+    const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const oauthStartMatch = requestUrl.pathname.match(/^\/oauth\/(facebook|tiktok|shopee)\/start$/);
+    if (oauthStartMatch && req.method === 'GET') return await oauthStart(req, res, requestUrl, oauthStartMatch[1]);
+    const oauthCallbackMatch = requestUrl.pathname.match(/^\/oauth\/(facebook|tiktok|shopee)\/callback$/);
+    if (oauthCallbackMatch && req.method === 'GET') return await oauthCallback(req, res, requestUrl, oauthCallbackMatch[1]);
 
-  if (pathname === '/healthz' && req.method === 'GET') {
-    const [ffmpeg, ffprobe] = await Promise.all([commandOk(FFMPEG, ['-version']), commandOk(FFPROBE, ['-version'])]);
-    return json(res, 200, {
-      ok: ffmpeg && ffprobe,
-      version: VERSION,
-      ffmpeg,
-      ffprobe,
-      activeSessions: activeSessionCount(),
-      maxSessions: MAX_SESSIONS,
-      smartLinkConfigured: !!SMART_LINK_BASE_URL,
-      apiKeyConfigured: !!API_KEY,
-      pendingSessionCreates,
-      sessionRetentionMs: SESSION_RETENTION_MS,
-      authOk: authorized(req)
-    });
-  }
+    if (requestUrl.pathname === '/api/facebook/destinations' && req.method === 'POST') return await handleFacebookDestinations(req, res);
+    if (requestUrl.pathname === '/api/facebook/live/start' && req.method === 'POST') return await handleFacebookLiveStart(req, res);
+    if (requestUrl.pathname === '/api/facebook/live/status' && req.method === 'POST') return await handleFacebookLiveStatus(req, res);
+    if (requestUrl.pathname === '/api/facebook/live/end' && req.method === 'POST') return await handleFacebookLiveEnd(req, res);
 
-  if (!authorized(req)) return json(res, 401, { ok: false, error: 'Unauthorized' });
-
-  const uploadMatch = /^\/api\/uploads\/([a-zA-Z0-9_-]+)$/.exec(pathname);
-  if (uploadMatch && req.method === 'PUT') return uploadFile(req, res, uploadMatch[1]);
-  if (uploadMatch && req.method === 'DELETE') {
-    const id = safeId(uploadMatch[1]);
-    const meta = uploads.get(id);
-    const file = meta?.path || path.join(UPLOAD_DIR, id);
-    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
-    uploads.delete(id);
-    return json(res, 200, { ok: true });
-  }
-
-  if (pathname === '/api/sessions' && req.method === 'GET') {
-    return json(res, 200, { ok: true, sessions: [...sessions.values()].map(publicSession) });
-  }
-  if (pathname === '/api/sessions' && req.method === 'POST') {
-    try {
-      const body = await readJson(req);
-      const session = await createSession(body);
-      return json(res, 201, { ok: true, sessionId: session.id, ...publicSession(session) });
-    } catch (e) {
-      return json(res, 400, { ok: false, error: e.message || String(e) });
+    if (requestUrl.pathname === '/healthz') {
+      const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, { ok: ffmpeg && ffprobe && ytdlp, version: GATEWAY_VERSION, node: process.version, ffmpeg, ffprobe, ytdlp, youtubeCookies: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE), facebookCookies: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE), proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY), youtubeProxyConfigured: Boolean(YTDLP_PROXY), metaProxyConfigured: Boolean(META_PROXY), youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE, youtubePoHttpProvider: youtubePoHttpRunning, youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default' });
     }
+    if (requestUrl.pathname === '/health') {
+      if (!keyOk(req, requestUrl)) return json(res, 401, { ok: false, error: 'invalid gateway key' });
+      const [ffmpeg, ffprobe, ytdlp] = await Promise.all([commandExists(FFMPEG), commandExists(FFPROBE), commandExists(YTDLP)]);
+      return json(res, ffmpeg && ffprobe && ytdlp ? 200 : 503, {
+        ok: ffmpeg && ffprobe && ytdlp,
+        ffmpeg,
+        ffprobe,
+        ytdlp,
+        version: GATEWAY_VERSION,
+        cookiesConfigured: Boolean(YTDLP_COOKIES_FILE || YOUTUBE_COOKIES_FILE || FACEBOOK_COOKIES_FILE),
+        youtubeCookiesConfigured: Boolean(YOUTUBE_COOKIES_FILE || YTDLP_COOKIES_FILE),
+        facebookCookiesConfigured: Boolean(FACEBOOK_COOKIES_FILE || YTDLP_COOKIES_FILE),
+        proxyConfigured: Boolean(YTDLP_PROXY || META_PROXY),
+        youtubeProxyConfigured: Boolean(YTDLP_PROXY),
+        metaProxyConfigured: Boolean(META_PROXY),
+        youtubePoProvider: YOUTUBE_PO_PROVIDER_AVAILABLE,
+        youtubePoHttpProvider: youtubePoHttpRunning,
+        youtubePlayerClients: EFFECTIVE_YOUTUBE_PLAYER_CLIENTS || 'default',
+        node: process.version,
+        jsRuntime: 'node',
+        resolution: RESOLUTION.replace(':', 'x')
+      });
+    }
+    if ((requestUrl.pathname === '/api/probe-v4' || requestUrl.pathname === '/api/probe-v5') && req.method === 'GET') return await handleProbe(req, res, requestUrl);
+    if ((requestUrl.pathname === '/api/source' || requestUrl.pathname === '/api/source-v2' || requestUrl.pathname === '/api/source-v3' || requestUrl.pathname === '/api/source-v4' || requestUrl.pathname === '/api/source-v5') && req.method === 'GET') return await handleSource(req, res, requestUrl);
+    return json(res, 404, { ok: false, error: 'not found' });
+  } catch (e) {
+    console.error(e);
+    if (!res.headersSent) json(res, 500, { ok: false, error: String(e?.message || 'internal error').slice(0, 500) });
+    else res.destroy(e);
   }
+});
 
-  const statusMatch = /^\/api\/sessions\/([a-zA-Z0-9_-]+)$/.exec(pathname);
-  if (statusMatch && req.method === 'GET') {
-    const s = sessions.get(statusMatch[1]);
-    if (!s) return json(res, 404, { ok: false, error: 'Session không tồn tại' });
-    return json(res, 200, { ok: true, ...publicSession(s) });
-  }
+startYoutubePoProvider();
 
-  const stopMatch = /^\/api\/sessions\/([a-zA-Z0-9_-]+)\/stop$/.exec(pathname);
-  if (stopMatch && req.method === 'POST') {
-    const s = sessions.get(stopMatch[1]);
-    if (!s) return json(res, 404, { ok: false, error: 'Session không tồn tại' });
-    stopSession(s);
-    return json(res, 200, { ok: true, ...publicSession(s) });
-  }
-
-  return json(res, 404, { ok: false, error: 'Not found' });
+process.once('exit', () => {
+  shuttingDown = true;
+  if (youtubePoRestartTimer) clearTimeout(youtubePoRestartTimer);
+  if (youtubePoHttpProcess && !youtubePoHttpProcess.killed) youtubePoHttpProcess.kill('SIGTERM');
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[ShopLive Online Worker] ${VERSION} listening on ${HOST}:${PORT} maxSessions=${MAX_SESSIONS}`);
+  console.log(`ShopLive Gateway ${GATEWAY_VERSION} listening on http://${HOST}:${PORT}`);
+  if (!API_KEY) console.warn('WARNING: GATEWAY_API_KEY is empty. Set a key before exposing this service outside your LAN.');
+  if (!OAUTH_STORE_KEY) console.warn('WARNING: OAUTH_STORE_KEY is empty. OAuth tokens will only live in memory and are lost when Gateway restarts.');
+  if (PUBLIC_BASE_URL && !PUBLIC_BASE_URL.startsWith('https://')) console.warn('WARNING: PUBLIC_BASE_URL must be HTTPS for provider OAuth callbacks.');
 });
-
-function shutdown() {
-  for (const s of sessions.values()) stopSession(s);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 8000).unref();
-}
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
