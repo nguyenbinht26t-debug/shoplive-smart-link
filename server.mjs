@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { URL } from 'node:url';
 
-const VERSION = '2.8.4-online-worker-fixed1';
+const VERSION = '2.8.7-online-worker-1session';
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
 const API_KEY = (process.env.WORKER_API_KEY || '').trim();
@@ -14,7 +14,7 @@ const SMART_LINK_KEY = (process.env.SMART_LINK_KEY || '').trim();
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
 const UPLOAD_DIR = process.env.UPLOAD_DIR || '/tmp/shoplive-online/uploads';
-const MAX_SESSIONS = numericSetting(process.env.MAX_SESSIONS, 3, 1, 3);
+const MAX_SESSIONS = 1;
 const MAX_UPLOAD_BYTES = numericSetting(process.env.MAX_UPLOAD_BYTES, 1610612736, 50 * 1024 * 1024);
 const MAX_RESTARTS = 6;
 const SESSION_RETENTION_MS = numericSetting(process.env.SESSION_RETENTION_MS, 6 * 60 * 60 * 1000, 60_000);
