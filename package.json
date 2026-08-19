@@ -1,13 +1,11 @@
 {
-  "name": "shoplive-ai-gateway-clean",
+  "name": "shoplive-ai-online-worker",
   "private": true,
-  "version": "2.8.7",
+  "version": "2.8.4-fixed.1",
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
     "check": "node --check server.mjs"
   },
-  "engines": {
-    "node": ">=22"
-  }
+  "engines": { "node": ">=22" }
 }
